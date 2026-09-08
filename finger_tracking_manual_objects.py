@@ -22,6 +22,8 @@ FINGER_SMOOTHING = 0.35          # lower = smoother
 MAX_FINGER_JUMP = 140.0          # map pixels; rejects detections after occlusion
 MAX_MISSED_FRAMES = 20
 
+STAIRS_BOX_FRAC = (0.05, 0.05, 0.95, 0.95)  # wide test box for tonight, shrink once we know real stairs coords
+
 ui_mode = "align"
 drag_pts = []
 active_pt_idx = -1
@@ -300,6 +302,22 @@ def assign_detections(tracks, detections):
             tracks.append(FingerTrack(detections[j], f"Finger {len(tracks) + 1}"))
 
 
+def in_box(pt, box):
+    x0, y0, x1, y1 = box
+    return x0 <= pt[0] <= x1 and y0 <= pt[1] <= y1
+
+
+def update_symbol_timer(state, handedness, in_region, timestamp_ms, symbol="stairs"):
+    # start/stop per hand per symbol, prints when it fires
+    key = (handedness, symbol)
+    if in_region and key not in state:
+        state[key] = timestamp_ms
+        print(f"[{symbol}] {handedness} start {timestamp_ms}ms")
+    elif not in_region and key in state:
+        start = state.pop(key)
+        print(f"[{symbol}] {handedness} stop {timestamp_ms}ms, dur {timestamp_ms - start}ms")
+
+
 def draw_trail(canvas, samples, color):
     previous = None
     for point in samples:
@@ -344,6 +362,8 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     ref_h, ref_w = ref_img.shape[:2]
     ref_corners = np.float32([[0, 0], [ref_w - 1, 0],
                               [ref_w - 1, ref_h - 1], [0, ref_h - 1]])
+    stairs_box = (STAIRS_BOX_FRAC[0] * ref_w, STAIRS_BOX_FRAC[1] * ref_h,
+                 STAIRS_BOX_FRAC[2] * ref_w, STAIRS_BOX_FRAC[3] * ref_h)
 
     cap = cv2.VideoCapture(video_path)
     ok, frame = cap.read()
@@ -386,6 +406,7 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     pose = PagePose(ref_img, frame, drag_pts)
     tracks = []
     raw_paths = {"Left": [], "Right": []}
+    symbol_timers = {}
     detector = vision.HandLandmarker.create_from_options(
         vision.HandLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path="hand_landmarker.task"),
@@ -445,6 +466,8 @@ def manual_keyframe_tracking(video_path, reference_image_path,
                         raw_paths.setdefault(handedness, []).append(
                             tuple(np.rint(mapped).astype(int)))
                         seen_hands.add(handedness)
+                        update_symbol_timer(symbol_timers, handedness,
+                                            in_box(mapped, stairs_box), timestamp_ms)
             # A None creates a visible break rather than connecting across an
             # interval in which MediaPipe did not actually see that hand.
             for handedness, samples in raw_paths.items():
