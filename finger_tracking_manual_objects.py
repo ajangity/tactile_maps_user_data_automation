@@ -47,6 +47,13 @@ EDGE_ANGLE_TOLERANCE = 20.0        # deg, segment-to-expected-side angle slop
 EDGE_CORNER_ANGLE_TOLERANCE = 25.0 # deg, how far a corner may be from 90
 EDGE_ASPECT_TOLERANCE = 0.35       # relative aspect-ratio slop vs reference
 MIN_COLD_START_MATCHES = 20        # SIFT/ORB good matches needed to auto-lock
+EDGE_VERIFY_MIN_MATCHES = 12        # SIFT/ORB good matches needed to accept an
+                                    # edge-detector lock as real content, not a
+                                    # shape-valid false positive (e.g. a shadow
+                                    # that happens to look like a straight edge).
+                                    # Lower than MIN_COLD_START_MATCHES since the
+                                    # edge detector's geometry is already a
+                                    # decent prior; this just needs corroboration.
 
 ui_mode = "align"
 drag_pts = []
@@ -100,11 +107,27 @@ def _paper_mask(frame_bgr):
     exceed any reasonable fixed threshold in bright spots, while paper stays
     reliably ~200+. Otsu's method re-derives the paper/background split from
     each frame's own histogram instead, which tracks that variation.
+
+    The same problem applies to skin rejection: a fixed saturation ceiling
+    was tuned against one lighting/white-balance setup and won't hold under
+    a different one. Otsu re-derives that cutoff too, from the saturation
+    of just the already-bright pixels, so it isn't skewed by the desk or
+    shadows. (Canny's fixed thresholds right below this, in _fit_quad and
+    draw_edge_debug, don't have the same issue: they run on this mask after
+    it's already binary, where any threshold well under the maximum
+    black/white gradient finds the same edges, so there's nothing for an
+    adaptive threshold to actually change there.)
     """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     s, v = hsv[:, :, 1], hsv[:, :, 2]
     _, mask = cv2.threshold(v, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    mask[s > PAPER_SAT_MAX] = 0
+    sat_max = PAPER_SAT_MAX
+    bright_sat = s[mask > 0]
+    if bright_sat.size > 200:
+        sat_max = float(cv2.threshold(
+            bright_sat.reshape(-1, 1), 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0])
+    mask[s > sat_max] = 0
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     return mask
@@ -154,17 +177,46 @@ def _side_expected_angles(corners):
     }
 
 
-def _side_center(corners, side):
+def _side_endpoints(corners, side):
     tl, tr, br, bl = corners
     pairs = {"top": (tl, tr), "bottom": (bl, br), "left": (tl, bl), "right": (tr, br)}
-    a, b = pairs[side]
-    return (np.asarray(a, np.float32) + np.asarray(b, np.float32)) / 2.0
+    return pairs[side]
+
+
+def _point_to_line_distance(pt, a, b):
+    """Perpendicular distance from pt to the infinite line through a and b."""
+    a, b, pt = (np.asarray(a, np.float32), np.asarray(b, np.float32),
+               np.asarray(pt, np.float32))
+    d = b - a
+    norm = np.linalg.norm(d)
+    if norm < 1e-6:
+        return float(np.linalg.norm(pt - a))
+    return float(abs(np.cross(d, pt - a)) / norm)
 
 
 def _fit_line_through_points(points):
-    """Robust infinite-line fit; returns (point_on_line, unit_direction)."""
+    """Robust infinite-line fit; returns (point_on_line, unit_direction).
+
+    A first Huber fit still gives every point some pull, including points
+    from a segment that's misclassified onto the wrong side. This drops
+    points whose distance from that first fit is a clear outlier (by
+    median absolute deviation) and refits on what's left, closer to how
+    RANSAC would fully discard a bad segment instead of just down-weighting it.
+    """
     pts = np.asarray(points, np.float32).reshape(-1, 1, 2)
     vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+    if len(pts) < 6:
+        return np.array([x0, y0], np.float32), np.array([vx, vy], np.float32)
+    p0, d = np.array([x0, y0], np.float32), np.array([vx, vy], np.float32)
+    flat = pts.reshape(-1, 2)
+    offsets = flat - p0
+    perp = np.abs(offsets[:, 0] * d[1] - offsets[:, 1] * d[0])
+    median = np.median(perp)
+    mad = np.median(np.abs(perp - median)) + 1e-6
+    keep = perp <= median + 4.0 * mad
+    if 4 <= keep.sum() < len(flat):
+        pts = flat[keep].reshape(-1, 1, 2)
+        vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
     return np.array([x0, y0], np.float32), np.array([vx, vy], np.float32)
 
 
@@ -179,7 +231,7 @@ def _intersect_lines(line_a, line_b):
     return p0 + t * d0
 
 
-def _sample_segment_points(x1, y1, x2, y2, step=4.0):
+def _sample_segment_points(x1, y1, x2, y2, step=4.0, weight=1.0):
     """Points evenly spaced along a segment, not just its 2 endpoints.
 
     A straight line is fully determined by 2 points, so this adds no new
@@ -188,29 +240,52 @@ def _sample_segment_points(x1, y1, x2, y2, step=4.0):
     a short, noisy one when multiple segments are pooled and fit together.
     Without it, a clean 200px edge and a noisy 25px stub used to count
     equally (2 points each), which is backwards.
+
+    `weight` scales that point count down for a segment whose angle only
+    loosely matches the side it was assigned to, so a long segment that's a
+    borderline angle match can no longer outweigh a short, clean match of
+    the same side just by virtue of being long.
     """
     length = math.hypot(x2 - x1, y2 - y1)
-    n = max(2, int(length // step) + 1)
+    n = max(2, int(weight * length // step) + 1)
     t = np.linspace(0.0, 1.0, n)
     return list(zip(x1 + t * (x2 - x1), y1 + t * (y2 - y1)))
 
 
-def _classify_with_prior(segments, expected, centers):
+def _classify_segment(x1, y1, x2, y2, expected, corners):
+    """Pick the side (if any) this segment belongs to, and how good the
+    angle match is (0 = exact, up to EDGE_ANGLE_TOLERANCE).
+
+    Matches by angle first, then by perpendicular distance from the
+    segment's midpoint to that side's actual line -- not distance to the
+    side's midpoint, which is unreliable near corners: a segment can sit
+    geometrically closer to the wrong side's midpoint than to the line it's
+    actually on, especially once the page is skewed under perspective.
+    """
+    angle = _line_angle(x1, y1, x2, y2)
+    mid = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], np.float32)
+    best_side, best_dist, best_angle_err = None, None, None
+    for side, exp_angle in expected.items():
+        angle_err = _angle_diff(angle, exp_angle)
+        if angle_err > EDGE_ANGLE_TOLERANCE:
+            continue
+        a, b = _side_endpoints(corners, side)
+        dist = _point_to_line_distance(mid, a, b)
+        if best_dist is None or dist < best_dist:
+            best_side, best_dist, best_angle_err = side, dist, angle_err
+    return best_side, best_angle_err
+
+
+def _classify_with_prior(segments, expected, corners):
     """Assign each Hough segment to a side using the last known quad as a
-    prior: match by angle first, then by which side's center it's nearest."""
+    prior, and weight it by how clean that assignment is."""
     sides = {"top": [], "bottom": [], "left": [], "right": []}
     for x1, y1, x2, y2 in segments:
-        angle = _line_angle(x1, y1, x2, y2)
-        mid = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], np.float32)
-        best_side, best_dist = None, None
-        for side, exp_angle in expected.items():
-            if _angle_diff(angle, exp_angle) > EDGE_ANGLE_TOLERANCE:
-                continue
-            dist = float(np.linalg.norm(mid - centers[side]))
-            if best_dist is None or dist < best_dist:
-                best_side, best_dist = side, dist
-        if best_side is not None:
-            sides[best_side].extend(_sample_segment_points(x1, y1, x2, y2))
+        side, angle_err = _classify_segment(x1, y1, x2, y2, expected, corners)
+        if side is not None:
+            weight = max(0.15, 1.0 - angle_err / EDGE_ANGLE_TOLERANCE)
+            sides[side].extend(
+                _sample_segment_points(x1, y1, x2, y2, weight=weight))
     return sides
 
 
@@ -399,8 +474,7 @@ class PaperEdgeDetector:
 
         prior = np.asarray(prior, np.float32)
         expected = _side_expected_angles(prior)
-        centers = {s: _side_center(prior, s) for s in expected}
-        sides = _classify_with_prior(segments, expected, centers)
+        sides = _classify_with_prior(segments, expected, prior)
 
         lines = {}
         fresh = {}
@@ -656,13 +730,22 @@ class PagePose:
 
         edge_quad = self.edge_detector.track(frame, self.corners, strict=trusted)
         if edge_quad is not None:
-            self.corners = ((1.0 - PAGE_POSE_SMOOTHING) * before +
-                            PAGE_POSE_SMOOTHING * edge_quad)
-            self.source = "edge"
-            self.prev_gray = gray
-            self.flow_points = self._seed_flow(gray)
-            self._note_confirmed()
-            return self.corners
+            # A shape-valid quad (right aspect ratio, ~90 degree corners) can
+            # still be positionally wrong, e.g. a shadow or crease that
+            # happened to read as a straight edge. Cross-check it against the
+            # actual reference image content before trusting it, the same way
+            # a from-scratch cold-start candidate already has to earn its lock.
+            score = score_candidate_quad(gray, edge_quad, self.reference_gray,
+                                         self.ref_corners, self.feature,
+                                         self.matcher, self.ratio, self.ref_des)
+            if score >= EDGE_VERIFY_MIN_MATCHES:
+                self.corners = ((1.0 - PAGE_POSE_SMOOTHING) * before +
+                                PAGE_POSE_SMOOTHING * edge_quad)
+                self.source = "edge"
+                self.prev_gray = gray
+                self.flow_points = self._seed_flow(gray)
+                self._note_confirmed()
+                return self.corners
 
         corners = self._fallback_track(frame, gray, before, strict=trusted)
         if self.source == "PNG":
@@ -867,21 +950,14 @@ def draw_edge_debug(shown, frame, corners, frame_w, frame_h):
     if segments is None:
         return
     expected = _side_expected_angles(p)
-    centers = {s: _side_center(p, s) for s in expected}
     side_colors = {"top": (0, 0, 255), "bottom": (255, 0, 0),
                   "left": (0, 255, 0), "right": (0, 255, 255)}
     for xs1, ys1, xs2, ys2 in segments.reshape(-1, 4):
         xs1, xs2 = xs1 + x0, xs2 + x0
         ys1, ys2 = ys1 + y0, ys2 + y0
-        angle = _line_angle(xs1, ys1, xs2, ys2)
-        mid = np.array([(xs1 + xs2) / 2.0, (ys1 + ys2) / 2.0], np.float32)
-        best_side, best_dist = None, None
-        for side, exp_angle in expected.items():
-            if _angle_diff(angle, exp_angle) > EDGE_ANGLE_TOLERANCE:
-                continue
-            dist = float(np.linalg.norm(mid - centers[side]))
-            if best_dist is None or dist < best_dist:
-                best_side, best_dist = side, dist
+        # Same classification the real tracker uses, so this overlay shows
+        # what's actually happening rather than a separate approximation of it.
+        best_side, _ = _classify_segment(xs1, ys1, xs2, ys2, expected, p)
         color = side_colors.get(best_side, (200, 200, 200))
         cv2.line(shown, (int(xs1), int(ys1)), (int(xs2), int(ys2)), color, 2)
     cv2.putText(shown, "Edge debug (key 'e' to toggle): red=top blue=bottom "
