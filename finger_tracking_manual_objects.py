@@ -1,5 +1,7 @@
 import argparse
+import json
 import math
+import os
 import time
 
 import cv2
@@ -7,6 +9,8 @@ import mediapipe as mp
 import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+
+from trace_map import ink_mask, trace_walls, find_symbol_blobs, classify_shape
 
 
 # Estimate a fresh PNG -> video homography on every frame.  Unlike four independent
@@ -27,8 +31,6 @@ MAX_UNCONFIRMED_FRAMES = 45      # ~1.5s @30fps of pure flow/hold before
                                  # re-searching the whole frame
 RECOVERY_RETRY_INTERVAL = 5      # frames between full-frame reacquisition
                                  # attempts while lost (bounds CPU cost)
-
-STAIRS_BOX_FRAC = (0.05, 0.05, 0.95, 0.95)  # wide test box for tonight, shrink once we know real stairs coords
 
 # Automatic paper-edge detection: segment the white page from the desk and
 # hands via an Otsu-adaptive brightness split (see _paper_mask), fit a line
@@ -53,6 +55,7 @@ drag_pts = []
 active_pt_idx = -1
 is_paused = True
 show_edge_debug = False
+show_wall_trace = False
 
 
 def mouse_handler(event, x, y, flags, param):
@@ -822,15 +825,40 @@ def in_box(pt, box):
     return x0 <= pt[0] <= x1 and y0 <= pt[1] <= y1
 
 
-def update_symbol_timer(state, handedness, in_region, timestamp_ms, symbol="stairs"):
-    # start/stop per hand per symbol, prints when it fires
+def load_symbol_boxes(map_path, ref_w, ref_h):
+    """Named symbol regions in ref-map pixel space, from label_symbols.py's
+    <map>.symbols.json (each symbol labeled once on the key, not per video)."""
+    json_path = os.path.splitext(map_path)[0] + ".symbols.json"
+    if not os.path.exists(json_path):
+        print(f"No {json_path} -- run label_symbols.py on this map first. "
+              "Continuing without symbol stats.")
+        return {}
+    with open(json_path) as f:
+        fractions = json.load(f)
+    return {name: (fx0 * ref_w, fy0 * ref_h, fx1 * ref_w, fy1 * ref_h)
+            for name, (fx0, fy0, fx1, fy1) in fractions.items()}
+
+
+def update_symbol_timer(state, stats, handedness, in_region, timestamp_ms, symbol):
+    # start/stop per hand per symbol; closed intervals roll into stats as a
+    # visit count + total dwell time so we have real numbers for Michelle,
+    # not just console prints.
     key = (handedness, symbol)
     if in_region and key not in state:
         state[key] = timestamp_ms
-        print(f"[{symbol}] {handedness} start {timestamp_ms}ms")
     elif not in_region and key in state:
         start = state.pop(key)
-        print(f"[{symbol}] {handedness} stop {timestamp_ms}ms, dur {timestamp_ms - start}ms")
+        entry = stats.setdefault(symbol, {"visits": 0, "total_ms": 0})
+        entry["visits"] += 1
+        entry["total_ms"] += timestamp_ms - start
+
+
+def save_symbol_stats(stats, path):
+    with open(path, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"Saved {path}")
+    for symbol, entry in sorted(stats.items(), key=lambda kv: -kv[1]["total_ms"]):
+        print(f"  {symbol}: {entry['visits']} visit(s), {entry['total_ms']}ms total")
 
 
 def draw_trail(canvas, samples, color):
@@ -889,6 +917,32 @@ def draw_edge_debug(shown, frame, corners, frame_w, frame_h):
                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
 
 
+def draw_wall_trace_debug(shown, frame, frame_h):
+    """Wall-line + symbol-blob trace over the raw frame (trace_map.py's
+    pipeline), so which lines/blobs it's actually picking up -- and, via the
+    green tracked quad already drawn every frame, which paper -- is visible
+    live instead of only after the fact on a saved image."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mask = ink_mask(gray)
+    walls = trace_walls(mask)
+    wall_mask = np.zeros_like(mask)
+    for x1, y1, x2, y2 in walls:
+        cv2.line(wall_mask, (x1, y1), (x2, y2), 255, 3)
+    blobs = find_symbol_blobs(mask, wall_mask)
+
+    for x1, y1, x2, y2 in walls:
+        cv2.line(shown, (x1, y1), (x2, y2), (0, 0, 255), 2)
+    for i, box in enumerate(blobs):
+        x, y, w, h, _ = box
+        label = classify_shape(mask, box)
+        cv2.rectangle(shown, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        cv2.putText(shown, f"{i}:{label}", (x, max(0, y - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(shown, f"Wall trace (key 'w' to toggle): {len(walls)} walls, "
+               f"{len(blobs)} blobs", (18, frame_h - 20),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+
+
 def page_hand_crop(frame, corners):
     """Return an enlarged page-centered ROI and its frame-coordinate mapping."""
     h, w = frame.shape[:2]
@@ -913,7 +967,7 @@ def page_hand_crop(frame, corners):
 
 def manual_keyframe_tracking(video_path, reference_image_path,
                              output_path="finger_paths.png"):
-    global drag_pts, is_paused, ui_mode, show_edge_debug
+    global drag_pts, is_paused, ui_mode, show_edge_debug, show_wall_trace
     ref_img = cv2.imread(reference_image_path)
     if ref_img is None:
         raise FileNotFoundError(reference_image_path)
@@ -921,8 +975,7 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     ref_h, ref_w = ref_img.shape[:2]
     ref_corners = np.float32([[0, 0], [ref_w - 1, 0],
                               [ref_w - 1, ref_h - 1], [0, ref_h - 1]])
-    stairs_box = (STAIRS_BOX_FRAC[0] * ref_w, STAIRS_BOX_FRAC[1] * ref_h,
-                 STAIRS_BOX_FRAC[2] * ref_w, STAIRS_BOX_FRAC[3] * ref_h)
+    symbol_boxes = load_symbol_boxes(reference_image_path, ref_w, ref_h)
 
     cap = cv2.VideoCapture(video_path)
     ok, frame = cap.read()
@@ -977,6 +1030,7 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     tracks = []
     raw_paths = {"Left": [], "Right": []}
     symbol_timers = {}
+    symbol_stats = {}
     detector = vision.HandLandmarker.create_from_options(
         vision.HandLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path="hand_landmarker.task"),
@@ -995,8 +1049,8 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     detection_count = 0
     display_markers = []
     playback_speed = DEFAULT_PLAYBACK_SPEED
-    print("Tracking. Space pauses/resumes; e toggles the edge-detection debug "
-          "overlay; q saves and quits.")
+    print("Tracking. Space pauses/resumes; e toggles the page-edge debug "
+          "overlay; w toggles the wall/symbol trace overlay; q saves and quits.")
     while True:
         loop_started = time.perf_counter()
         if not is_paused:
@@ -1037,8 +1091,9 @@ def manual_keyframe_tracking(video_path, reference_image_path,
                         raw_paths.setdefault(handedness, []).append(
                             tuple(np.rint(mapped).astype(int)))
                         seen_hands.add(handedness)
-                        update_symbol_timer(symbol_timers, handedness,
-                                            in_box(mapped, stairs_box), timestamp_ms)
+                        for name, box in symbol_boxes.items():
+                            update_symbol_timer(symbol_timers, symbol_stats, handedness,
+                                                in_box(mapped, box), timestamp_ms, name)
             # A None creates a visible break rather than connecting across an
             # interval in which MediaPipe did not actually see that hand.
             for handedness, samples in raw_paths.items():
@@ -1079,6 +1134,8 @@ def manual_keyframe_tracking(video_path, reference_image_path,
                         cv2.LINE_AA)
         if show_edge_debug:
             draw_edge_debug(shown, frame, corners, frame_w, frame_h)
+        if show_wall_trace:
+            draw_wall_trace_debug(shown, frame, frame_h)
         cv2.imshow("Video Tracker", shown)
         if is_paused:
             wait_ms = 10
@@ -1101,6 +1158,9 @@ def manual_keyframe_tracking(video_path, reference_image_path,
         elif key == ord("e"):
             show_edge_debug = not show_edge_debug
             print(f"Edge debug overlay: {'on' if show_edge_debug else 'off'}")
+        elif key == ord("w"):
+            show_wall_trace = not show_wall_trace
+            print(f"Wall trace overlay: {'on' if show_wall_trace else 'off'}")
         elif key == ord("q"):
             break
 
@@ -1116,6 +1176,16 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     cap.release()
     cv2.destroyAllWindows()
     print(f"Saved {output_path}")
+
+    # close out any symbol dwell timers still open when the video ended/quit
+    final_timestamp_ms = int(round(1000.0 * frame_index / fps))
+    for (handedness, symbol), start in list(symbol_timers.items()):
+        entry = symbol_stats.setdefault(symbol, {"visits": 0, "total_ms": 0})
+        entry["visits"] += 1
+        entry["total_ms"] += final_timestamp_ms - start
+    if symbol_boxes:
+        stats_path = os.path.splitext(video_path)[0] + ".symbol_stats.json"
+        save_symbol_stats(symbol_stats, stats_path)
 
 
 if __name__ == "__main__":
