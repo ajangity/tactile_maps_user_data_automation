@@ -21,12 +21,17 @@ DEFAULT_PLAYBACK_SPEED = 1.5     # processes every frame; only display timing ch
 FINGER_SMOOTHING = 0.35          # lower = smoother
 MAX_FINGER_JUMP = 140.0          # map pixels; rejects detections after occlusion
 MAX_MISSED_FRAMES = 20
-MAX_UNCONFIRMED_FRAMES = 45      # ~1.5s @30fps of pure flow/hold before
+MAX_UNCONFIRMED_FRAMES = 20      # ~0.7s @30fps of pure flow/hold before
                                  # distrusting the lock (it may have drifted
                                  # onto a hand or the wrong sheet) and
-                                 # re-searching the whole frame
-RECOVERY_RETRY_INTERVAL = 5      # frames between full-frame reacquisition
-                                 # attempts while lost (bounds CPU cost)
+                                 # re-searching the whole frame. Was 45
+                                 # (~1.5s); lowered now that per-candidate
+                                 # SIFT verification only runs when there's
+                                 # genuine ambiguity, making each recovery
+                                 # attempt cheaper than it used to be.
+RECOVERY_RETRY_INTERVAL = 3      # frames between full-frame reacquisition
+                                 # attempts while lost (bounds CPU cost).
+                                 # Was 5; same reasoning as above.
 
 STAIRS_BOX_FRAC = (0.05, 0.05, 0.95, 0.95)  # wide test box for tonight, shrink once we know real stairs coords
 
@@ -46,19 +51,72 @@ EDGE_HOUGH_THRESHOLD = 40
 EDGE_ANGLE_TOLERANCE = 20.0        # deg, segment-to-expected-side angle slop
 EDGE_CORNER_ANGLE_TOLERANCE = 25.0 # deg, how far a corner may be from 90
 EDGE_ASPECT_TOLERANCE = 0.35       # relative aspect-ratio slop vs reference
+STABLE_CORNER_TOLERANCE = 2.0      # px; a visible corner within this of last
+                                    # frame counts as "hasn't moved"
+MIN_STABLE_CORNERS = 2             # this many stationary visible corners
+                                    # means the page itself didn't move, so
+                                    # keep last frame's corners as-is instead
+                                    # of applying this frame's re-fit noise
 MIN_COLD_START_MATCHES = 20        # SIFT/ORB good matches needed to auto-lock
+EDGE_VERIFY_MIN_MATCHES = 12        # SIFT/ORB good matches needed to accept an
+                                    # edge-detector lock as real content, not a
+                                    # shape-valid false positive (e.g. a shadow
+                                    # that happens to look like a straight edge).
+                                    # Lower than MIN_COLD_START_MATCHES since the
+                                    # edge detector's geometry is already a
+                                    # decent prior; this just needs corroboration.
 
 ui_mode = "align"
 drag_pts = []
 active_pt_idx = -1
 is_paused = True
 show_edge_debug = False
+window_scale = 1.0     # video-frame -> displayed-window scale factor, kept in
+window_offset = (0, 0) # sync with show_scaled() so mouse_handler can map a
+                        # click in the (resizable, letterboxed) window back to
+                        # the actual frame pixel it landed on.
+
+
+def show_scaled(winname, image):
+    """Display image in winname, letterboxed to the window's current size so
+    resizing the OS window never crops the frame -- it only scales it, with
+    black bars added on whichever axis doesn't match the frame's aspect
+    ratio. Records the scale/offset used so mouse_handler can convert a click
+    in window pixels back into the original frame's coordinate space, which
+    is what the homography and corner dragging actually operate on.
+    """
+    global window_scale, window_offset
+    h, w = image.shape[:2]
+    try:
+        _, _, win_w, win_h = cv2.getWindowImageRect(winname)
+    except cv2.error:
+        win_w, win_h = 0, 0
+    if win_w < 2 or win_h < 2:
+        # Window geometry isn't available yet (first frame before the OS has
+        # realized it) -- show at native size; real scaling kicks in once
+        # the window exists, which imshow below causes for next time.
+        window_scale, window_offset = 1.0, (0, 0)
+        cv2.imshow(winname, image)
+        return
+    scale = min(win_w / w, win_h / h)
+    disp_w = max(1, int(round(w * scale)))
+    disp_h = max(1, int(round(h * scale)))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(image, (disp_w, disp_h), interpolation=interp)
+    canvas = np.zeros((win_h, win_w, 3), np.uint8)
+    off_x, off_y = (win_w - disp_w) // 2, (win_h - disp_h) // 2
+    canvas[off_y:off_y + disp_h, off_x:off_x + disp_w] = resized
+    window_scale, window_offset = scale, (off_x, off_y)
+    cv2.imshow(winname, canvas)
 
 
 def mouse_handler(event, x, y, flags, param):
     global active_pt_idx
     if ui_mode != "align" and not is_paused:
         return
+    off_x, off_y = window_offset
+    x = (x - off_x) / window_scale
+    y = (y - off_y) / window_scale
     can_edit = (ui_mode == "align" or is_paused)
     if event == cv2.EVENT_LBUTTONDOWN and can_edit:
         if not drag_pts:
@@ -100,39 +158,68 @@ def _paper_mask(frame_bgr):
     exceed any reasonable fixed threshold in bright spots, while paper stays
     reliably ~200+. Otsu's method re-derives the paper/background split from
     each frame's own histogram instead, which tracks that variation.
+
+    The same problem applies to skin rejection: a fixed saturation ceiling
+    was tuned against one lighting/white-balance setup and won't hold under
+    a different one. Otsu re-derives that cutoff too, from the saturation
+    of just the already-bright pixels, so it isn't skewed by the desk or
+    shadows. (Canny's fixed thresholds right below this, in _fit_quad and
+    draw_edge_debug, don't have the same issue: they run on this mask after
+    it's already binary, where any threshold well under the maximum
+    black/white gradient finds the same edges, so there's nothing for an
+    adaptive threshold to actually change there.)
     """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     s, v = hsv[:, :, 1], hsv[:, :, 2]
     _, mask = cv2.threshold(v, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    mask[s > PAPER_SAT_MAX] = 0
+    sat_max = PAPER_SAT_MAX
+    bright_sat = s[mask > 0]
+    if bright_sat.size > 200:
+        # Only let Otsu tighten the cutoff, never loosen it: if a frame's
+        # "bright" pixels are dominated by a hand (skin can be bright too,
+        # just not paper-white), Otsu's own split of that population drifts
+        # its cutoff upward past the calibrated skin range (~28-41) and skin
+        # starts passing as "paper" -- exactly what lets two separate sheets
+        # bridge into one connected blob when a hand rests between them.
+        sat_max = min(PAPER_SAT_MAX, float(cv2.threshold(
+            bright_sat.reshape(-1, 1), 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]))
+    mask[s > sat_max] = 0
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     return mask
 
 
-def _isolate_nearest_component(mask, roi_bounds, prior_center):
-    """Crop to roi_bounds, keeping only the connected paper-colored blob
-    nearest prior_center -- a second sheet that has drifted into the same
-    search window is a separate component and gets zeroed out, so its real,
-    straight, paper-colored edges can never leak into this frame's line fit.
+def _isolate_candidate_components(mask, roi_bounds, prior_center,
+                                  max_candidates=3):
+    """Crop to roi_bounds, returning each connected paper-colored blob above
+    the noise-area floor as its own isolated mask, nearest prior_center
+    first, capped to max_candidates.
+
+    A second sheet that's drifted into the same search window is a separate
+    component -- previously this kept only the nearest one, so its real,
+    straight, paper-colored edges could never leak into this frame's line
+    fit, but that also meant the choice of *which* sheet was tracked was
+    purely positional, with no check that it was actually the right page.
+    Returning every candidate lets the caller score each against the real
+    reference content (the way cold-start already does across the whole
+    frame) and pick by match quality instead of just proximity, but only
+    when there's genuinely more than one blob to choose between -- the
+    common single-paper case still does exactly the one geometry fit it did
+    before.
     """
     x0, y0, x1, y1 = roi_bounds
     crop = mask[y0:y1, x0:x1]
     num, labels, stats, centroids = cv2.connectedComponentsWithStats(
         crop, connectivity=8)
     if num <= 1:
-        return None
+        return []
     local_center = np.asarray(prior_center, np.float32) - [x0, y0]
-    best_label, best_dist = None, None
-    for lbl in range(1, num):
-        if stats[lbl, cv2.CC_STAT_AREA] < 400:
-            continue
-        dist = np.linalg.norm(centroids[lbl] - local_center)
-        if best_dist is None or dist < best_dist:
-            best_label, best_dist = lbl, dist
-    if best_label is None:
-        return None
-    return np.where(labels == best_label, np.uint8(255), np.uint8(0))
+    ranked = sorted(
+        (lbl for lbl in range(1, num) if stats[lbl, cv2.CC_STAT_AREA] >= 400),
+        key=lambda lbl: np.linalg.norm(centroids[lbl] - local_center))
+    return [np.where(labels == lbl, np.uint8(255), np.uint8(0))
+            for lbl in ranked[:max_candidates]]
 
 
 def _line_angle(x1, y1, x2, y2):
@@ -154,17 +241,46 @@ def _side_expected_angles(corners):
     }
 
 
-def _side_center(corners, side):
+def _side_endpoints(corners, side):
     tl, tr, br, bl = corners
     pairs = {"top": (tl, tr), "bottom": (bl, br), "left": (tl, bl), "right": (tr, br)}
-    a, b = pairs[side]
-    return (np.asarray(a, np.float32) + np.asarray(b, np.float32)) / 2.0
+    return pairs[side]
+
+
+def _point_to_line_distance(pt, a, b):
+    """Perpendicular distance from pt to the infinite line through a and b."""
+    a, b, pt = (np.asarray(a, np.float32), np.asarray(b, np.float32),
+               np.asarray(pt, np.float32))
+    d = b - a
+    norm = np.linalg.norm(d)
+    if norm < 1e-6:
+        return float(np.linalg.norm(pt - a))
+    return float(abs(np.cross(d, pt - a)) / norm)
 
 
 def _fit_line_through_points(points):
-    """Robust infinite-line fit; returns (point_on_line, unit_direction)."""
+    """Robust infinite-line fit; returns (point_on_line, unit_direction).
+
+    A first Huber fit still gives every point some pull, including points
+    from a segment that's misclassified onto the wrong side. This drops
+    points whose distance from that first fit is a clear outlier (by
+    median absolute deviation) and refits on what's left, closer to how
+    RANSAC would fully discard a bad segment instead of just down-weighting it.
+    """
     pts = np.asarray(points, np.float32).reshape(-1, 1, 2)
     vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+    if len(pts) < 6:
+        return np.array([x0, y0], np.float32), np.array([vx, vy], np.float32)
+    p0, d = np.array([x0, y0], np.float32), np.array([vx, vy], np.float32)
+    flat = pts.reshape(-1, 2)
+    offsets = flat - p0
+    perp = np.abs(offsets[:, 0] * d[1] - offsets[:, 1] * d[0])
+    median = np.median(perp)
+    mad = np.median(np.abs(perp - median)) + 1e-6
+    keep = perp <= median + 4.0 * mad
+    if 4 <= keep.sum() < len(flat):
+        pts = flat[keep].reshape(-1, 1, 2)
+        vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
     return np.array([x0, y0], np.float32), np.array([vx, vy], np.float32)
 
 
@@ -179,7 +295,7 @@ def _intersect_lines(line_a, line_b):
     return p0 + t * d0
 
 
-def _sample_segment_points(x1, y1, x2, y2, step=4.0):
+def _sample_segment_points(x1, y1, x2, y2, step=4.0, weight=1.0):
     """Points evenly spaced along a segment, not just its 2 endpoints.
 
     A straight line is fully determined by 2 points, so this adds no new
@@ -188,29 +304,52 @@ def _sample_segment_points(x1, y1, x2, y2, step=4.0):
     a short, noisy one when multiple segments are pooled and fit together.
     Without it, a clean 200px edge and a noisy 25px stub used to count
     equally (2 points each), which is backwards.
+
+    `weight` scales that point count down for a segment whose angle only
+    loosely matches the side it was assigned to, so a long segment that's a
+    borderline angle match can no longer outweigh a short, clean match of
+    the same side just by virtue of being long.
     """
     length = math.hypot(x2 - x1, y2 - y1)
-    n = max(2, int(length // step) + 1)
+    n = max(2, int(weight * length // step) + 1)
     t = np.linspace(0.0, 1.0, n)
     return list(zip(x1 + t * (x2 - x1), y1 + t * (y2 - y1)))
 
 
-def _classify_with_prior(segments, expected, centers):
+def _classify_segment(x1, y1, x2, y2, expected, corners):
+    """Pick the side (if any) this segment belongs to, and how good the
+    angle match is (0 = exact, up to EDGE_ANGLE_TOLERANCE).
+
+    Matches by angle first, then by perpendicular distance from the
+    segment's midpoint to that side's actual line -- not distance to the
+    side's midpoint, which is unreliable near corners: a segment can sit
+    geometrically closer to the wrong side's midpoint than to the line it's
+    actually on, especially once the page is skewed under perspective.
+    """
+    angle = _line_angle(x1, y1, x2, y2)
+    mid = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], np.float32)
+    best_side, best_dist, best_angle_err = None, None, None
+    for side, exp_angle in expected.items():
+        angle_err = _angle_diff(angle, exp_angle)
+        if angle_err > EDGE_ANGLE_TOLERANCE:
+            continue
+        a, b = _side_endpoints(corners, side)
+        dist = _point_to_line_distance(mid, a, b)
+        if best_dist is None or dist < best_dist:
+            best_side, best_dist, best_angle_err = side, dist, angle_err
+    return best_side, best_angle_err
+
+
+def _classify_with_prior(segments, expected, corners):
     """Assign each Hough segment to a side using the last known quad as a
-    prior: match by angle first, then by which side's center it's nearest."""
+    prior, and weight it by how clean that assignment is."""
     sides = {"top": [], "bottom": [], "left": [], "right": []}
     for x1, y1, x2, y2 in segments:
-        angle = _line_angle(x1, y1, x2, y2)
-        mid = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], np.float32)
-        best_side, best_dist = None, None
-        for side, exp_angle in expected.items():
-            if _angle_diff(angle, exp_angle) > EDGE_ANGLE_TOLERANCE:
-                continue
-            dist = float(np.linalg.norm(mid - centers[side]))
-            if best_dist is None or dist < best_dist:
-                best_side, best_dist = side, dist
-        if best_side is not None:
-            sides[best_side].extend(_sample_segment_points(x1, y1, x2, y2))
+        side, angle_err = _classify_segment(x1, y1, x2, y2, expected, corners)
+        if side is not None:
+            weight = max(0.15, 1.0 - angle_err / EDGE_ANGLE_TOLERANCE)
+            sides[side].extend(
+                _sample_segment_points(x1, y1, x2, y2, weight=weight))
     return sides
 
 
@@ -290,6 +429,91 @@ def _refine_corners_subpix(frame, quad, refine_mask):
     return out
 
 
+def _corner_visible_by_content(frame, point, window=24):
+    """Is this corner's current position actually visible (not covered by a
+    hand) in the frame right now?
+
+    Deliberately independent of which tracking source (edge/PNG/flow/held)
+    produced the position: it looks directly at a neighborhood around the
+    point using the same brightness/saturation split validated earlier this
+    project (paper ~200+ V, ~15 S; skin ~130-170 V, ~28-41 S). A local Otsu
+    split on just this patch separates whatever's brighter there (paper, if
+    visible) from whatever's darker (desk, or a hand sitting lower than
+    paper); checking the saturation of the brighter side is then a direct
+    occlusion read on that specific point, not a byproduct of which
+    algorithm happened to win the whole-page fit this frame.
+
+    Uses an absolute minimum pixel count per side rather than a ratio: a
+    real corner's estimate is rarely dead-centered on the true corner
+    (especially mid-recovery), so the true split can easily land far from
+    50/50 within the window without the corner being any less real or
+    visible -- a ratio bound was rejecting those as "degenerate" when they
+    weren't.
+    """
+    x, y = int(round(point[0])), int(round(point[1]))
+    h, w = frame.shape[:2]
+    x0, y0 = max(0, x - window), max(0, y - window)
+    x1, y1 = min(w, x + window), min(h, y + window)
+    if x1 - x0 < 6 or y1 - y0 < 6:
+        return False
+    patch = frame[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    s, v = hsv[:, :, 1], hsv[:, :, 2]
+    _, bright = cv2.threshold(v, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    min_pixels = 20
+    if int(np.sum(bright > 0)) < min_pixels or int(np.sum(bright == 0)) < min_pixels:
+        # No real paper/desk split in this neighborhood at all -- either
+        # entirely dark (off the page) or entirely bright with nothing to
+        # split against (a hand fully filling the window reads this way
+        # too) -- either way, not a trustworthy read of a genuine corner.
+        return False
+    bright_sat = s[bright > 0]
+    return float(np.median(bright_sat)) <= PAPER_SAT_MAX
+
+
+CORNER_OUTLIER_MAX_OTHER_MOVE = 6.0   # px; the other 3 corners must each be
+                                      # this stationary for the 4th's motion
+                                      # to be judged suspicious rather than
+                                      # real (possibly non-rigid-looking but
+                                      # legitimate) page motion
+CORNER_OUTLIER_MIN_MOVE = 18.0       # px; the outlier itself must have moved
+                                      # at least this much to matter
+CORNER_OUTLIER_RATIO = 3.0           # and by at least this multiple of the
+                                      # other 3's own (already-small) movement
+
+
+def _correct_outlier_corner(new_corners, prior_corners):
+    """A physical page is rigid: every real camera/page motion moves all 4
+    corners together under one consistent transform. If 3 corners barely
+    moved from last frame while the 4th moved far more than the other 3,
+    that is not a real rigid motion -- no transform of a flat rectangle
+    holds 3 corners almost exactly in place while displacing the 4th that
+    much on its own. It's a measurement error on that one corner (source-
+    independent: this runs after edge/PNG/flow have all already produced
+    their result), so replace it with what the rigid (affine) transform the
+    other 3 corners actually underwent predicts it should be, rather than
+    trusting the raw, erratic value.
+    """
+    new_corners = np.asarray(new_corners, np.float32)
+    prior_corners = np.asarray(prior_corners, np.float32)
+    moves = np.linalg.norm(new_corners - prior_corners, axis=1)
+    outlier = int(np.argmax(moves))
+    others = [i for i in range(4) if i != outlier]
+    other_moves = moves[others]
+    if not (moves[outlier] >= CORNER_OUTLIER_MIN_MOVE and
+            moves[outlier] >= CORNER_OUTLIER_RATIO * (np.max(other_moves) + 1e-3) and
+            np.all(other_moves <= CORNER_OUTLIER_MAX_OTHER_MOVE)):
+        return new_corners
+    src = prior_corners[others]
+    dst = new_corners[others]
+    M = cv2.getAffineTransform(src, dst)
+    predicted = M @ np.array([prior_corners[outlier, 0],
+                              prior_corners[outlier, 1], 1.0], np.float32)
+    corrected = new_corners.copy()
+    corrected[outlier] = predicted
+    return corrected
+
+
 class PaperEdgeDetector:
     """Locate the physical page's 4 corners from its visible edges alone.
 
@@ -312,6 +536,14 @@ class PaperEdgeDetector:
         from drift), so a correct detection can immediately snap to the true
         position instead of being rejected for disagreeing with a baseline
         that was already wrong.
+
+        Returns a list of (quad, lines, visible) candidates, not a single
+        quad: when
+        the search window holds more than one paper-colored blob, each one
+        that produces a geometrically valid quad is included, so the caller
+        can pick between them by actual content match (see
+        PagePose.update()) instead of this function silently committing to
+        whichever blob happened to be closest.
         """
         h, w = frame.shape[:2]
         mask = _paper_mask(frame)
@@ -323,23 +555,44 @@ class PaperEdgeDetector:
         x0, y0 = max(0, x0), max(0, y0)
         x1, y1 = min(w, x1), min(h, y1)
         # The search window can contain a second, separate sheet of paper --
-        # isolate just the blob nearest our last known position so its edges
-        # (real, straight, paper-colored) never leak into this frame's fit.
-        crop_mask = _isolate_nearest_component(mask, (x0, y0, x1, y1), centre)
-        if crop_mask is None:
-            return None
-        quad, lines = self._fit_quad(frame, crop_mask, x0, y0, prior_corners,
-                                     self.last_valid)
-        if quad is None:
-            return None
-        # A shape-valid quad can still be positionally wrong (motion blur, a
-        # stray shadow briefly read as an edge) -- reject an implausible jump
-        # from last frame rather than let it flash through for one frame.
-        step = np.linalg.norm(quad - p, axis=1)
-        if strict and np.max(step) > EDGE_MAX_FRAME_MOTION * math.hypot(w, h):
-            return None
+        # each one becomes its own isolated candidate mask, so a wrong
+        # sheet's real, straight, paper-colored edges never leak into
+        # another candidate's line fit.
+        candidates = _isolate_candidate_components(mask, (x0, y0, x1, y1), centre)
+        results = []
+        for i, crop_mask in enumerate(candidates):
+            quad, lines, visible = self._fit_quad(frame, crop_mask, x0, y0,
+                                                   prior_corners, self.last_valid)
+            if i == 0 and lines:
+                # The nearest candidate is almost certainly the same page we
+                # were already tracking, even on a frame where hands cover
+                # enough of it that no complete quad can be built from it.
+                # Fold in whatever sides genuinely were detected fresh this
+                # frame, so a side hidden this frame but visible a couple
+                # frames ago -- or again a couple frames from now -- isn't
+                # stuck on a stale fallback just because all 4 sides never
+                # happened to be visible in the exact same single frame.
+                # A full winning quad still fully overwrites this via
+                # confirm() below, this only helps the frames where nothing
+                # wins outright.
+                self.last_valid.update(lines)
+            if quad is None:
+                continue
+            # A shape-valid quad can still be positionally wrong (motion
+            # blur, a stray shadow briefly read as an edge) -- reject an
+            # implausible jump from last frame rather than let it flash
+            # through for one frame.
+            step = np.linalg.norm(quad - p, axis=1)
+            if strict and np.max(step) > EDGE_MAX_FRAME_MOTION * math.hypot(w, h):
+                continue
+            results.append((quad, lines, visible))
+        return results
+
+    def confirm(self, lines):
+        """Record which candidate's line fits actually won, so next frame's
+        fallback (a side hidden behind a hand this frame) extrapolates from
+        the correct page, not a rejected decoy."""
         self.last_valid = lines
-        return quad
 
     def find_candidate_quads(self, frame):
         """Cold-start search: every sufficiently large paper-colored blob.
@@ -376,8 +629,8 @@ class PaperEdgeDetector:
             x1, y1 = min(w, x + bw + pad_x), min(h, y + bh + pad_y)
             # blob, not mask: keep this candidate isolated from any other
             # paper-colored blob whose padded bbox happens to overlap here.
-            quad, _ = self._fit_quad(frame, blob[y0:y1, x0:x1], x0, y0,
-                                     rough_quad, {})
+            quad, _, _ = self._fit_quad(frame, blob[y0:y1, x0:x1], x0, y0,
+                                        rough_quad, {}, check_stable=False)
             if quad is not None:
                 candidates.extend(_quad_relabelings(quad))
         return candidates
@@ -385,22 +638,23 @@ class PaperEdgeDetector:
     def reset(self):
         self.last_valid = {}
 
-    def _fit_quad(self, frame, crop_mask, x0, y0, prior, last_valid):
+    def _fit_quad(self, frame, crop_mask, x0, y0, prior, last_valid,
+                  check_stable=True):
+        not_visible = [False, False, False, False]
         if crop_mask.shape[1] < 20 or crop_mask.shape[0] < 20:
-            return None, {}
+            return None, {}, not_visible
         edges = cv2.Canny(crop_mask, 50, 150)
         segments = cv2.HoughLinesP(edges, 1, np.pi / 180, EDGE_HOUGH_THRESHOLD,
                                     minLineLength=EDGE_MIN_SEGMENT_LEN, maxLineGap=12)
         if segments is None or len(segments) < 4:
-            return None, {}
+            return None, {}, not_visible
         segments = segments.reshape(-1, 4).astype(np.float32)
         segments[:, [0, 2]] += x0
         segments[:, [1, 3]] += y0
 
         prior = np.asarray(prior, np.float32)
         expected = _side_expected_angles(prior)
-        centers = {s: _side_center(prior, s) for s in expected}
-        sides = _classify_with_prior(segments, expected, centers)
+        sides = _classify_with_prior(segments, expected, prior)
 
         lines = {}
         fresh = {}
@@ -411,8 +665,13 @@ class PaperEdgeDetector:
             elif side in last_valid:
                 lines[side] = last_valid[side]
                 fresh[side] = False
+        # Whatever sides genuinely got a fresh line this frame, independent
+        # of whether all 4 came together into a usable quad -- returned even
+        # on failure below so a heavily but not totally occluded frame still
+        # contributes real information instead of being thrown away entirely.
+        fresh_lines = {s: ln for s, ln in lines.items() if fresh.get(s)}
         if len(lines) < 4:
-            return None, {}
+            return None, fresh_lines, not_visible
 
         try:
             tl = _intersect_lines(lines["top"], lines["left"])
@@ -420,13 +679,13 @@ class PaperEdgeDetector:
             br = _intersect_lines(lines["bottom"], lines["right"])
             bl = _intersect_lines(lines["bottom"], lines["left"])
         except np.linalg.LinAlgError:
-            return None, {}
+            return None, fresh_lines, not_visible
         if any(pt is None for pt in (tl, tr, br, bl)):
-            return None, {}
+            return None, fresh_lines, not_visible
         quad = np.array([tl, tr, br, bl], np.float32)
         h, w = frame.shape[:2]
         if not _valid_quad_geometry(quad, w, h, self.ref_aspect):
-            return None, {}
+            return None, fresh_lines, not_visible
 
         # A corner whose both adjacent sides were actually seen this frame is
         # a real, unoccluded corner -- cv2.cornerSubPix can snap the
@@ -434,12 +693,31 @@ class PaperEdgeDetector:
         # gradients. A corner with a fallback side is, by definition, hidden
         # this frame; there's no real corner in the image there to refine
         # onto, so leave that estimate as the (still fully valid) extrapolation.
+        # This same fresh-both-sides signal is also this corner's ground-truth
+        # visibility, reported back to the caller for display (green/orange
+        # dots) -- it doesn't just gate refinement internally.
         corner_sides = (("top", "left"), ("top", "right"),
                         ("bottom", "right"), ("bottom", "left"))
         refine = [fresh.get(a, False) and fresh.get(b, False)
                  for a, b in corner_sides]
+        visible = list(refine)
         quad = _refine_corners_subpix(frame, quad, refine)
-        return quad, lines
+
+        # A page that hasn't actually moved can still recrop slightly every
+        # frame: a marginally different Hough segment set, a sub-pixel nudge
+        # from cornerSubPix. If enough of the corners we're confident about
+        # (both adjacent sides seen fresh this frame, not extrapolated)
+        # land right back where they were last frame, treat that as "the
+        # page didn't move" and keep the prior corners exactly rather than
+        # apply that noise as a recrop.
+        if check_stable:
+            still = sum(
+                1 for i in range(4)
+                if refine[i] and
+                np.linalg.norm(quad[i] - prior[i]) <= STABLE_CORNER_TOLERANCE)
+            if still >= MIN_STABLE_CORNERS:
+                quad = prior.copy()
+        return quad, lines, visible
 
 
 def build_feature_matcher(reference_gray):
@@ -459,11 +737,51 @@ def build_feature_matcher(reference_gray):
     return feature, matcher, ratio, ref_kp, ref_des
 
 
+def _text_region_mask(ref_gray, dilate_px=6):
+    """Mark small, sharp-edged blob regions in a reference image -- the
+    signature of printed text, individual letters are small and roughly as
+    tall as wide, unlike the bigger, simpler filled shapes used for point
+    symbols (circles, squares, L shapes). Used to weight feature matches
+    toward genuinely distinctive content: two different pages can share the
+    exact same small set of generic point symbols, but text is close to
+    unique between them, so a match landing on text is much stronger
+    evidence this candidate really is the page with that text on it.
+    """
+    mser = cv2.MSER_create()
+    regions, _ = mser.detectRegions(ref_gray)
+    mask = np.zeros(ref_gray.shape, np.uint8)
+    h, w = ref_gray.shape
+    for region in regions:
+        x, y, rw, rh = cv2.boundingRect(region.reshape(-1, 1, 2))
+        if rw < 0.04 * w and rh < 0.06 * h and rh > 3 and rw > 1:
+            mask[y:y + rh, x:x + rw] = 255
+    if dilate_px:
+        mask = cv2.dilate(mask, np.ones((dilate_px, dilate_px), np.uint8))
+    return mask
+
+
 def score_candidate_quad(frame_gray, quad, ref_gray, ref_corners, feature, matcher,
-                         ratio, ref_des):
+                         ratio, ref_kp, ref_des, text_mask=None, text_weight=3.0):
     """Warp a candidate quad back to map space and count good feature matches
     against the reference map -- distinguishes the real floorplan sheet from
-    a second blank/lightly-printed sheet (e.g. a legend page) in frame."""
+    a second blank/lightly-printed sheet (e.g. a legend page) in frame.
+
+    text_mask, from _text_region_mask, lets a match landing on real text
+    count for text_weight instead of 1. Two pages sharing the same handful
+    of generic point symbols can rack up a deceptively high plain match
+    count on those alone; weighting text heavily makes this score a much
+    sharper "is this genuinely the page with this text on it" signal.
+
+    (A Canny-edge-density pre-filter was tried here and reverted: it
+    directly broke a real, correct match -- one real frame's true floorplan
+    candidate scored 26 good weighted matches, comfortably over threshold,
+    but its measured edge density was ~0.5% of the reference's, so the
+    filter force-rejected it before SIFT ever ran. Edge density turned out
+    to be far more sensitive to per-frame blur/lighting than a single
+    calibration test showed, and SIFT+text alone already correctly rejects
+    the legend-sheet case it was meant to help with -- so it added a
+    confirmed failure mode without a measured benefit.)
+    """
     if ref_des is None:
         return 0
     ref_h, ref_w = ref_gray.shape
@@ -474,7 +792,16 @@ def score_candidate_quad(frame_gray, quad, ref_gray, ref_corners, feature, match
         return 0
     pairs = matcher.knnMatch(ref_des, des, k=2)
     good = [pr[0] for pr in pairs if len(pr) == 2 and pr[0].distance < ratio * pr[1].distance]
-    return len(good)
+    if text_mask is None:
+        return len(good)
+    mh, mw = text_mask.shape
+    score = 0.0
+    for m in good:
+        x, y = ref_kp[m.queryIdx].pt
+        xi, yi = int(round(x)), int(round(y))
+        on_text = 0 <= xi < mw and 0 <= yi < mh and text_mask[yi, xi]
+        score += text_weight if on_text else 1.0
+    return score
 
 
 def auto_locate_page(frame, ref_gray, ref_corners, ref_aspect):
@@ -484,12 +811,14 @@ def auto_locate_page(frame, ref_gray, ref_corners, ref_aspect):
     candidates = detector.find_candidate_quads(frame)
     if not candidates:
         return None
-    feature, matcher, ratio, _, ref_des = build_feature_matcher(ref_gray)
+    feature, matcher, ratio, ref_kp, ref_des = build_feature_matcher(ref_gray)
+    text_mask = _text_region_mask(ref_gray)
     frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     best_quad, best_score = None, 0
     for quad in candidates:
         score = score_candidate_quad(frame_gray, quad, ref_gray, ref_corners,
-                                     feature, matcher, ratio, ref_des)
+                                     feature, matcher, ratio, ref_kp, ref_des,
+                                     text_mask=text_mask)
         if score > best_score:
             best_quad, best_score = quad, score
     if best_score < MIN_COLD_START_MATCHES:
@@ -510,6 +839,7 @@ class PagePose:
         # SIFT is much more stable than CSRT/ORB under perspective, scale and glare.
         (self.feature, self.matcher, self.ratio,
          self.ref_kp, self.ref_des) = build_feature_matcher(self.reference_gray)
+        self.text_mask = _text_region_mask(self.reference_gray)
         self.edge_detector = PaperEdgeDetector(self.ref_aspect)
         self.inliers = 0
         self.error = float("inf")
@@ -518,13 +848,24 @@ class PagePose:
         self.frames_since_confirmed = 0
         self.recovery_tick = 0
         self.lost = False
+        self.corner_visible = [False, False, False, False]
         self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.flow_points = self._seed_flow(self.prev_gray)
+        self.flow_points = self._seed_flow(frame, self.prev_gray)
 
-    def _seed_flow(self, gray):
+    def _seed_flow(self, frame_bgr, gray):
+        """Seed dense flow points on real page texture only.
+
+        Restricting to _paper_mask, not just the quad interior, keeps points
+        off any hand resting on the page: a point placed on skin tracks the
+        hand's own motion instead of the page's, and enough of those can
+        still form a self-consistent (but wrong) homography under RANSAC --
+        the page-shaped-but-not-the-page drift seen when a hand rests on the
+        sheet for a while.
+        """
         mask = np.zeros(gray.shape, np.uint8)
         cv2.fillConvexPoly(mask, np.int32(self.corners), 255)
         mask = cv2.erode(mask, np.ones((15, 15), np.uint8))
+        mask = cv2.bitwise_and(mask, _paper_mask(frame_bgr))
         return cv2.goodFeaturesToTrack(gray, 700, 0.008, 7, mask=mask,
                                        blockSize=7)
 
@@ -532,12 +873,13 @@ class PagePose:
         """Accept a paused manual correction as the new tracking state."""
         self.corners = np.asarray(corners, np.float32).copy()
         self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.flow_points = self._seed_flow(self.prev_gray)
+        self.flow_points = self._seed_flow(frame, self.prev_gray)
         self.edge_detector.reset()
         self.source = "manual"
         self.frames_since_confirmed = 0
         self.recovery_tick = 0
         self.lost = False
+        self.corner_visible = [False, False, False, False]
         self.inliers = 0
         self.error = 0.0
         self.coverage = 0.0
@@ -584,7 +926,15 @@ class PagePose:
         old_area = abs(cv2.contourArea(self.corners))
         new_area = abs(cv2.contourArea(candidate))
         area_ratio = new_area / max(old_area, 1.0)
-        geometry_ok = (valid_quad(candidate, w, h) and
+        # valid_quad alone only rejects collapsed/mirrored/off-frame quads --
+        # it says nothing about whether this quad is still roughly the right
+        # shape. _valid_quad_geometry adds the same ~90-degree-corner and
+        # reference-aspect-ratio checks the edge detector already relies on,
+        # which catches a homography that's self-consistent (good inlier
+        # count, low reprojection error) but has quietly warped into a
+        # non-rectangular quad, e.g. from inlier points clustered on a hand
+        # resting on part of the page.
+        geometry_ok = (_valid_quad_geometry(candidate, w, h, self.ref_aspect) and
                       self.error <= MAX_REPROJECTION_ERROR and
                       self.coverage >= MIN_INLIER_COVERAGE)
         # Only demand agreement with our current corners when they're
@@ -622,23 +972,63 @@ class PagePose:
         the wrong object. Unlike the per-frame chain (which only searches
         near the stale corners), this searches the whole frame again, same
         as the initial cold start, so it can find the real page wherever it
-        actually is."""
+        actually is.
+
+        find_candidate_quads has no prior, so every blob is scored in all 4
+        possible orientations -- with no memory of which one was already
+        known correct. SIFT content matching should usually still pick the
+        right one clearly, but recovery only ever runs under exactly the
+        low-visibility conditions that caused it to trigger in the first
+        place, where scores between orientations can end up close. The
+        physical page's orientation doesn't actually change between frames,
+        so when multiple candidates are genuinely close in score, breaking
+        the tie by which one is closest to the last known corners is
+        legitimate extra evidence, not a bias overriding a clear winner.
+        """
         candidates = self.edge_detector.find_candidate_quads(frame)
         if not candidates:
             return None
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        best_quad, best_score = None, 0
+        scored = []
         for quad in candidates:
             score = score_candidate_quad(frame_gray, quad, self.reference_gray,
                                          self.ref_corners, self.feature,
-                                         self.matcher, self.ratio, self.ref_des)
-            if score > best_score:
-                best_quad, best_score = quad, score
+                                         self.matcher, self.ratio, self.ref_kp,
+                                         self.ref_des, text_mask=self.text_mask)
+            scored.append((quad, score))
+        best_score = max(score for _, score in scored)
         if best_score < MIN_COLD_START_MATCHES:
             return None
-        return best_quad
+        near_tie = [quad for quad, score in scored if score >= 0.85 * best_score]
+        if len(near_tie) > 1:
+            prior = np.asarray(self.corners, np.float32)
+            return min(near_tie, key=lambda q: float(np.sum(
+                np.linalg.norm(np.asarray(q, np.float32) - prior, axis=1))))
+        return max(scored, key=lambda qs: qs[1])[0]
 
     def update(self, frame):
+        """Update this frame's corner positions, then independently assess
+        which corners are actually visible in the frame right now.
+
+        That second part deliberately isn't derived from which tracking
+        source won this frame: the edge detector's own fresh/stale signal
+        only reflects whether *its* pipeline happened to win (it can lose
+        for reasons that have nothing to do with occlusion -- content
+        verification, Hough thresholds elsewhere on the page), so a corner
+        sitting in plain sight while PNG/flow/held won the frame was always
+        being reported as "not visible". Checking the actual image content
+        at each corner's position, every frame, regardless of source, is
+        what actually answers "is this corner visible right now".
+        """
+        before = self.corners.copy()
+        corners = self._update_corners(frame)
+        corners = _correct_outlier_corner(corners, before)
+        self.corners = corners
+        self.corner_visible = [_corner_visible_by_content(frame, p)
+                               for p in corners]
+        return corners
+
+    def _update_corners(self, frame):
         """Prefer automatic edge detection; fall back to PNG registration or
         dense flow when the page's visible edges aren't enough this frame.
         If neither has confirmed the lock in a while, periodically re-search
@@ -654,13 +1044,45 @@ class PagePose:
         # with, and tracking could never self-correct.
         trusted = self.frames_since_confirmed == 0
 
-        edge_quad = self.edge_detector.track(frame, self.corners, strict=trusted)
-        if edge_quad is not None:
+        edge_candidates = self.edge_detector.track(frame, self.corners, strict=trusted)
+        best_quad, best_lines, best_score = None, None, -1
+        if len(edge_candidates) == 1 and trusted:
+            # Nothing to disambiguate (only one paper-colored blob found),
+            # and the current lock is already trusted -- SIFT content
+            # verification here would just be re-confirming what continuity
+            # and the existing geometry checks (aspect ratio, ~90 degree
+            # corners) already established. This is the common case (~2/3
+            # of frames in testing) and full SIFT verification is expensive
+            # (profiled as the dominant per-frame cost by a wide margin), so
+            # skip it. Multiple candidates, or a lock we don't already
+            # trust, still get scored below -- that's exactly when picking
+            # the wrong one is actually a risk.
+            best_quad, best_lines, best_score = (*edge_candidates[0][:2],
+                                                 EDGE_VERIFY_MIN_MATCHES)
+        else:
+            for quad, lines, _visible in edge_candidates:
+                # A shape-valid quad (right aspect ratio, ~90 degree corners)
+                # can still be positionally wrong, e.g. a shadow or crease
+                # that happened to read as a straight edge, or genuinely be
+                # a second sheet of paper. Score every candidate against the
+                # actual reference content, the same way a from-scratch
+                # cold-start candidate already has to earn its lock, and
+                # take whichever one matches best -- not just whichever was
+                # closest to last frame, which is what let a nearby second
+                # sheet win purely on position.
+                score = score_candidate_quad(gray, quad, self.reference_gray,
+                                             self.ref_corners, self.feature,
+                                             self.matcher, self.ratio, self.ref_kp,
+                                             self.ref_des, text_mask=self.text_mask)
+                if score > best_score:
+                    best_quad, best_lines, best_score = quad, lines, score
+        if best_quad is not None and best_score >= EDGE_VERIFY_MIN_MATCHES:
             self.corners = ((1.0 - PAGE_POSE_SMOOTHING) * before +
-                            PAGE_POSE_SMOOTHING * edge_quad)
+                            PAGE_POSE_SMOOTHING * best_quad)
             self.source = "edge"
+            self.edge_detector.confirm(best_lines)
             self.prev_gray = gray
-            self.flow_points = self._seed_flow(gray)
+            self.flow_points = self._seed_flow(frame, gray)
             self._note_confirmed()
             return self.corners
 
@@ -675,7 +1097,7 @@ class PagePose:
             if recovered is not None:
                 self.corners = recovered
                 self.edge_detector.reset()
-                self.flow_points = self._seed_flow(gray)
+                self.flow_points = self._seed_flow(frame, gray)
                 self.source = "recovered"
                 self._note_confirmed()
                 return self.corners
@@ -699,13 +1121,13 @@ class PagePose:
                           30, 0.01))
             if nxt is None or status is None:
                 self.prev_gray = gray
-                self.flow_points = self._seed_flow(gray)
+                self.flow_points = self._seed_flow(frame, gray)
                 return self.corners
             back, back_status, _ = cv2.calcOpticalFlowPyrLK(
                 gray, self.prev_gray, nxt, None, winSize=(25, 25), maxLevel=3)
             if back is None or back_status is None:
                 self.prev_gray = gray
-                self.flow_points = self._seed_flow(gray)
+                self.flow_points = self._seed_flow(frame, gray)
                 return self.corners
             fb = np.linalg.norm(self.flow_points[:, 0] - back[:, 0], axis=1)
             keep = ((status[:, 0] == 1) & (back_status[:, 0] == 1) & (fb < 1.5))
@@ -730,18 +1152,36 @@ class PagePose:
                     h, w = gray.shape
                     step = np.linalg.norm(candidate - before, axis=1)
                     if (inside.sum() >= MIN_PAGE_INLIERS and error < 2.0 and
-                            coverage > 0.08 and valid_quad(candidate, w, h) and
+                            coverage > 0.08 and
+                            _valid_quad_geometry(candidate, w, h, self.ref_aspect) and
                             np.max(step) < MAX_FRAME_MOTION * math.hypot(w, h)):
-                        self.corners = (0.15 * before + 0.85 * candidate)
-                        self.inliers = int(inside.sum())
-                        self.error = error
-                        self.coverage = coverage
-                        self.source = "flow"
+                        # Everything above (besides the geometry check) is
+                        # self-consistency: do these flow points agree with
+                        # each other and move plausibly. That alone doesn't
+                        # check whether they're still actually on the real
+                        # page -- a cluster of points sitting on a hand can
+                        # look just as internally consistent as points on the
+                        # page itself, just tracking the wrong thing (and
+                        # _valid_quad_geometry only catches the cases where
+                        # that produces a visibly non-rectangular quad, not
+                        # every case). Require the same real-content match
+                        # the other two paths do before trusting it.
+                        flow_score = score_candidate_quad(
+                            gray, candidate, self.reference_gray,
+                            self.ref_corners, self.feature, self.matcher,
+                            self.ratio, self.ref_kp, self.ref_des,
+                            text_mask=self.text_mask)
+                        if flow_score >= EDGE_VERIFY_MIN_MATCHES:
+                            self.corners = (0.15 * before + 0.85 * candidate)
+                            self.inliers = int(inside.sum())
+                            self.error = error
+                            self.coverage = coverage
+                            self.source = "flow"
 
         # Re-detect hundreds of page points each frame. RANSAC can tolerate an
         # occluding arm as long as visible map texture remains the majority.
         self.prev_gray = gray
-        self.flow_points = self._seed_flow(gray)
+        self.flow_points = self._seed_flow(frame, gray)
         return self.corners
 
 
@@ -867,21 +1307,14 @@ def draw_edge_debug(shown, frame, corners, frame_w, frame_h):
     if segments is None:
         return
     expected = _side_expected_angles(p)
-    centers = {s: _side_center(p, s) for s in expected}
     side_colors = {"top": (0, 0, 255), "bottom": (255, 0, 0),
                   "left": (0, 255, 0), "right": (0, 255, 255)}
     for xs1, ys1, xs2, ys2 in segments.reshape(-1, 4):
         xs1, xs2 = xs1 + x0, xs2 + x0
         ys1, ys2 = ys1 + y0, ys2 + y0
-        angle = _line_angle(xs1, ys1, xs2, ys2)
-        mid = np.array([(xs1 + xs2) / 2.0, (ys1 + ys2) / 2.0], np.float32)
-        best_side, best_dist = None, None
-        for side, exp_angle in expected.items():
-            if _angle_diff(angle, exp_angle) > EDGE_ANGLE_TOLERANCE:
-                continue
-            dist = float(np.linalg.norm(mid - centers[side]))
-            if best_dist is None or dist < best_dist:
-                best_side, best_dist = side, dist
+        # Same classification the real tracker uses, so this overlay shows
+        # what's actually happening rather than a separate approximation of it.
+        best_side, _ = _classify_segment(xs1, ys1, xs2, ys2, expected, p)
         color = side_colors.get(best_side, (200, 200, 200))
         cv2.line(shown, (int(xs1), int(ys1)), (int(xs2), int(ys2)), color, 2)
     cv2.putText(shown, "Edge debug (key 'e' to toggle): red=top blue=bottom "
@@ -943,9 +1376,12 @@ def manual_keyframe_tracking(video_path, reference_image_path,
               "map corner; the nearest green handle will follow. Press Enter "
               "when aligned.")
 
-    # AUTOSIZE keeps mouse coordinates in the same pixel coordinate system as
-    # the video frame, which is essential for an accurate homography.
-    cv2.namedWindow("Video Tracker", cv2.WINDOW_AUTOSIZE)
+    # NORMAL (resizable) rather than AUTOSIZE so the user can size the window
+    # to their screen; show_scaled()/mouse_handler keep the displayed image
+    # and click coordinates correctly mapped to the video frame regardless of
+    # the window's current size.
+    cv2.namedWindow("Video Tracker", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Video Tracker", frame_w, frame_h)
     cv2.setMouseCallback("Video Tracker", mouse_handler)
     ui_mode = "align"
     while True:
@@ -966,7 +1402,7 @@ def manual_keyframe_tracking(video_path, reference_image_path,
                     "Click/drag each map corner, then press Enter")
         cv2.putText(shown, align_msg, (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.imshow("Video Tracker", shown)
+        show_scaled("Video Tracker", shown)
         key = cv2.waitKey(20) & 0xFF
         if key in (10, 13):
             break
@@ -1056,8 +1492,14 @@ def manual_keyframe_tracking(video_path, reference_image_path,
         shown = frame.copy()
         blended = cv2.addWeighted(shown, 0.65, overlay, 0.35, 0)
         shown[mask > 0] = blended[mask > 0]
-        for p in corners:
-            cv2.circle(shown, tuple(np.int32(p)), 7, (0, 255, 0), -1)
+        # Green = this corner's own 2 edges were both freshly seen this exact
+        # frame (a real, unoccluded corner). Orange = extrapolated -- either
+        # a hidden corner recovered by intersecting lines from its still-
+        # visible sides, or the whole quad came from PNG/flow/recovery,
+        # which have no per-corner signal to report.
+        for p, vis in zip(corners, pose.corner_visible):
+            color = (0, 255, 0) if vis else (0, 165, 255)
+            cv2.circle(shown, tuple(np.int32(p)), 7, color, -1)
         cv2.putText(shown,
                     f"map: {pose.source}  matches: {pose.inliers}  error: {pose.error:.1f}px  "
                     f"coverage: {100 * pose.coverage:.1f}%  hands: {detection_count}  "
@@ -1079,7 +1521,7 @@ def manual_keyframe_tracking(video_path, reference_image_path,
                         cv2.LINE_AA)
         if show_edge_debug:
             draw_edge_debug(shown, frame, corners, frame_w, frame_h)
-        cv2.imshow("Video Tracker", shown)
+        show_scaled("Video Tracker", shown)
         if is_paused:
             wait_ms = 10
         else:
