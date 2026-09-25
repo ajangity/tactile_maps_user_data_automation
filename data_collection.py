@@ -182,15 +182,6 @@ def _warp_points(samples, H):
     return out
 
 
-def draw_points(canvas, samples, color, radius=3):
-    """One dot per recorded frame, not connected by lines -- unlike
-    draw_trail, consecutive frames are not joined, so gaps (None, where the
-    hand wasn't detected) need no special handling here."""
-    for point in samples:
-        if point is not None:
-            cv2.circle(canvas, point, radius, color, -1, cv2.LINE_AA)
-
-
 class FingerDataCollector:
     """Runs MediaPipe on each frame, maps any detected fingertip into
     paper-relative (map) space using that frame's already-known corners, and
@@ -273,12 +264,8 @@ class FingerDataCollector:
         return display_markers, len(detections)
 
     def draw_trails(self, canvas):
-        # Left: one continuous connected line (a "trail"). Right: one dot
-        # per recorded frame, left unconnected -- a per-frame point cloud
-        # rather than a smoothed path, so individual frame positions (and
-        # any pauses, where dots cluster) stay directly visible.
         draw_trail(canvas, self.raw_paths.get("Left", []), (0, 0, 255))
-        draw_points(canvas, self.raw_paths.get("Right", []), (255, 0, 0))
+        draw_trail(canvas, self.raw_paths.get("Right", []), (255, 0, 0))
 
     def draw_trails_in_frame(self, canvas, h_map_to_frame):
         """Same as draw_trails, but for overlaying onto a live *video* frame
@@ -291,7 +278,7 @@ class FingerDataCollector:
         left = _warp_points(self.raw_paths.get("Left", []), h_map_to_frame)
         right = _warp_points(self.raw_paths.get("Right", []), h_map_to_frame)
         draw_trail(canvas, left, (0, 0, 255))
-        draw_points(canvas, right, (255, 0, 0))
+        draw_trail(canvas, right, (255, 0, 0))
 
     def save_session_log(self, path):
         with open(path, "w", encoding="utf-8") as f:
