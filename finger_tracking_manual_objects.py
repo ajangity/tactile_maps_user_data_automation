@@ -1,5 +1,4 @@
 import argparse
-import json
 import math
 import os
 import time
@@ -7,7 +6,7 @@ import time
 import cv2
 import numpy as np
 
-from data_collection import FingerDataCollector
+from data_collection import FingerDataCollector, load_symbol_boxes
 
 from trace_map import ink_mask, trace_walls, find_symbol_blobs, classify_shape
 
@@ -28,6 +27,9 @@ FINGER_SMOOTHING = 0.35          # lower = smoother
 MAX_FINGER_JUMP = 140.0          # map pixels; rejects detections after occlusion
 MAX_MISSED_FRAMES = 20
 MAX_UNCONFIRMED_FRAMES = 20      # ~0.7s @30fps of pure flow/hold before
+                                 # distrusting the lock (it may have drifted
+                                 # onto a hand or the wrong sheet) and
+                                 # re-searching the whole frame. Was 45
                                  # distrusting the lock (it may have drifted
                                  # onto a hand or the wrong sheet) and
                                  # re-searching the whole frame. Was 45
@@ -1190,129 +1192,6 @@ class PagePose:
         return self.corners
 
 
-class FingerTrack:
-    def __init__(self, point, name):
-        self.point = np.asarray(point, np.float32)
-        self.name = name
-        self.missed = 0
-        self.samples = []       # None marks a break in the rendered path
-
-    def update(self, point):
-        point = np.asarray(point, np.float32)
-        distance = np.linalg.norm(point - self.point)
-        if distance > MAX_FINGER_JUMP:
-            # After a real occlusion, the hand may reappear far from its last
-            # location. Reacquire instead of leaving this track stuck forever.
-            if self.missed > MAX_MISSED_FRAMES:
-                if self.samples and self.samples[-1] is not None:
-                    self.samples.append(None)
-                self.point = point
-                self.missed = 0
-                self.samples.append(tuple(np.rint(self.point).astype(int)))
-                return
-            self.miss()
-            return
-        self.point = ((1.0 - FINGER_SMOOTHING) * self.point +
-                      FINGER_SMOOTHING * point)
-        self.missed = 0
-        self.samples.append(tuple(np.rint(self.point).astype(int)))
-
-    def miss(self):
-        self.missed += 1
-        if self.samples and self.samples[-1] is not None:
-            self.samples.append(None)
-
-
-def assign_detections(tracks, detections):
-    """Associate by position, not MediaPipe handedness (which often flips)."""
-    if not tracks:
-        for i, p in enumerate(sorted(detections, key=lambda q: q[0])):
-            tracks.append(FingerTrack(p, f"Finger {i + 1}"))
-        return
-    # Solve the two-hand assignment jointly. Greedy matching can let the first
-    # track steal the second hand's detection and make the other marker vanish.
-    if len(tracks) == 2 and len(detections) == 2:
-        direct = (np.linalg.norm(detections[0] - tracks[0].point) +
-                  np.linalg.norm(detections[1] - tracks[1].point))
-        crossed = (np.linalg.norm(detections[1] - tracks[0].point) +
-                   np.linalg.norm(detections[0] - tracks[1].point))
-        order = (0, 1) if direct <= crossed else (1, 0)
-        for track, j in zip(tracks, order):
-            track.update(detections[j])
-        return
-    if len(tracks) == 2 and len(detections) == 1:
-        chosen = min(range(2), key=lambda i: np.linalg.norm(
-            detections[0] - tracks[i].point))
-        tracks[chosen].update(detections[0])
-        tracks[1 - chosen].miss()
-        return
-    unused = set(range(len(detections)))
-    for track in tracks:
-        if not unused:
-            track.miss()
-            continue
-        j = min(unused, key=lambda k: np.linalg.norm(detections[k] - track.point))
-        if np.linalg.norm(detections[j] - track.point) <= MAX_FINGER_JUMP:
-            track.update(detections[j])
-            unused.remove(j)
-        else:
-            track.miss()
-    for j in unused:
-        if len(tracks) < 2:
-            tracks.append(FingerTrack(detections[j], f"Finger {len(tracks) + 1}"))
-
-
-def in_box(pt, box):
-    x0, y0, x1, y1 = box
-    return x0 <= pt[0] <= x1 and y0 <= pt[1] <= y1
-
-
-def load_symbol_boxes(map_path, ref_w, ref_h):
-    """Named symbol regions in ref-map pixel space, from label_symbols.py's
-    <map>.symbols.json (each symbol labeled once on the key, not per video)."""
-    json_path = os.path.splitext(map_path)[0] + ".symbols.json"
-    if not os.path.exists(json_path):
-        print(f"No {json_path} -- run label_symbols.py on this map first. "
-              "Continuing without symbol stats.")
-        return {}
-    with open(json_path) as f:
-        fractions = json.load(f)
-    return {name: (fx0 * ref_w, fy0 * ref_h, fx1 * ref_w, fy1 * ref_h)
-            for name, (fx0, fy0, fx1, fy1) in fractions.items()}
-
-
-def update_symbol_timer(state, stats, handedness, in_region, timestamp_ms, symbol):
-    # start/stop per hand per symbol; closed intervals roll into stats as a
-    # visit count + total dwell time so we have real numbers for Michelle,
-    # not just console prints.
-    key = (handedness, symbol)
-    if in_region and key not in state:
-        state[key] = timestamp_ms
-    elif not in_region and key in state:
-        start = state.pop(key)
-        entry = stats.setdefault(symbol, {"visits": 0, "total_ms": 0})
-        entry["visits"] += 1
-        entry["total_ms"] += timestamp_ms - start
-
-
-def save_symbol_stats(stats, path):
-    with open(path, "w") as f:
-        json.dump(stats, f, indent=2)
-    print(f"Saved {path}")
-    for symbol, entry in sorted(stats.items(), key=lambda kv: -kv[1]["total_ms"]):
-        print(f"  {symbol}: {entry['visits']} visit(s), {entry['total_ms']}ms total")
-
-
-def draw_trail(canvas, samples, color):
-    previous = None
-    for point in samples:
-        if point is None:
-            previous = None
-        elif previous is not None:
-            cv2.line(canvas, previous, point, color, 4, cv2.LINE_AA)
-            previous = point
-        else:
-            previous = point
 def draw_edge_debug(shown, frame, corners, frame_w, frame_h):
     """Overlay the paper mask and side-classified Hough segments so the
     automatic corner detector's thresholds can be tuned against real footage."""
@@ -1352,50 +1231,30 @@ def draw_edge_debug(shown, frame, corners, frame_w, frame_h):
 
 def draw_wall_trace_debug(shown, frame, frame_h):
     """Wall-line + symbol-blob trace over the raw frame (trace_map.py's
-    pipeline), so which lines/blobs it's actually picking up -- and, via the
-    green tracked quad already drawn every frame, which paper -- is visible
-    live instead of only after the fact on a saved image."""
+    pipeline), so which lines/blobs it's actually picking up is visible live
+    instead of only after the fact on a saved image."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     mask = ink_mask(gray)
     walls = trace_walls(mask)
     wall_mask = np.zeros_like(mask)
     for x1, y1, x2, y2 in walls:
-        cv2.line(wall_mask, (x1, y1), (x2, y2), 255, 3)
+        cv2.line(wall_mask, (int(x1), int(y1)), (int(x2), int(y2)), 255, 3)
     blobs = find_symbol_blobs(mask, wall_mask)
 
     for x1, y1, x2, y2 in walls:
-        cv2.line(shown, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.line(shown, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
     for i, box in enumerate(blobs):
         x, y, w, h, _ = box
         label = classify_shape(mask, box)
-        cv2.rectangle(shown, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        cv2.putText(shown, f"{i}:{label}", (x, max(0, y - 6)),
+        cv2.rectangle(shown, (int(x), int(y)), (int(x + w), int(y + h)),
+                      (255, 0, 0), 2)
+        cv2.putText(shown, f"{i}:{label}", (int(x), max(0, int(y) - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1, cv2.LINE_AA)
     cv2.putText(shown, f"Wall trace (key 'w' to toggle): {len(walls)} walls, "
-               f"{len(blobs)} blobs", (18, frame_h - 20),
+               f"{len(blobs)} blobs", (18, frame_h - 50),
                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
 
 
-def page_hand_crop(frame, corners):
-    """Return an enlarged page-centered ROI and its frame-coordinate mapping."""
-    h, w = frame.shape[:2]
-    p = np.asarray(corners, np.float32)
-    x0, y0 = np.floor(p.min(axis=0)).astype(int)
-    x1, y1 = np.ceil(p.max(axis=0)).astype(int)
-    margin_x = int(0.22 * max(x1 - x0, 1))
-    margin_y = int(0.30 * max(y1 - y0, 1))
-    x0, y0 = max(0, x0 - margin_x), max(0, y0 - margin_y)
-    x1, y1 = min(w, x1 + margin_x), min(h, y1 + margin_y)
-    crop = frame[y0:y1, x0:x1]
-    if crop.size == 0:
-        return frame, 0, 0, 1.0
-    # Small hands are the common reason only one is detected. Upscale the ROI,
-    # while capping size to keep inference responsive.
-    scale = min(2.5, max(1.0, 1280.0 / max(crop.shape[:2])))
-    if scale > 1.01:
-        crop = cv2.resize(crop, None, fx=scale, fy=scale,
-                          interpolation=cv2.INTER_CUBIC)
-    return crop, x0, y0, scale
 def manual_keyframe_tracking(video_path, reference_image_path,
                              output_path="finger_paths.png"):
     global drag_pts, is_paused, ui_mode, show_edge_debug, show_wall_trace
@@ -1406,7 +1265,6 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     ref_h, ref_w = ref_img.shape[:2]
     ref_corners = np.float32([[0, 0], [ref_w - 1, 0],
                               [ref_w - 1, ref_h - 1], [0, ref_h - 1]])
-    symbol_boxes = load_symbol_boxes(reference_image_path, ref_w, ref_h)
 
     cap = cv2.VideoCapture(video_path)
     ok, frame = cap.read()
@@ -1461,19 +1319,9 @@ def manual_keyframe_tracking(video_path, reference_image_path,
             cap.release(); cv2.destroyAllWindows(); return
 
     pose = PagePose(ref_img, frame, drag_pts)
-    collector = FingerDataCollector(ref_w, ref_h)
-    tracks = []
-    raw_paths = {"Left": [], "Right": []}
-    symbol_timers = {}
-    symbol_stats = {}
-    detector = vision.HandLandmarker.create_from_options(
-        vision.HandLandmarkerOptions(
-            base_options=python.BaseOptions(model_asset_path="hand_landmarker.task"),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,
-            min_hand_detection_confidence=0.25,
-            min_hand_presence_confidence=0.25,
-            min_tracking_confidence=0.35))
+    collector = FingerDataCollector(
+        ref_w, ref_h,
+        symbol_boxes=load_symbol_boxes(reference_image_path, ref_w, ref_h))
 
     ui_mode = "track"
     is_paused = False
@@ -1484,7 +1332,7 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     detection_count = 0
     display_markers = []
     playback_speed = DEFAULT_PLAYBACK_SPEED
-    print("Tracking. Space pauses/resumes; e toggles the page-edge debug "
+    print("Tracking. Space pauses/resumes; e toggles the edge-detection debug "
           "overlay; w toggles the wall/symbol trace overlay; q saves and quits.")
     while True:
         loop_started = time.perf_counter()
@@ -1498,45 +1346,8 @@ def manual_keyframe_tracking(video_path, reference_image_path,
             corners = np.asarray(drag_pts, np.float32)
             frame_index += 1
             timestamp_ms = int(round(1000.0 * frame_index / fps))
-            collector_markers, _ = collector.update(
+            display_markers, detection_count = collector.update(
                 frame, corners, frame_index, timestamp_ms)
-            result = detector.detect_for_video(mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=cv2.cvtColor(hand_image, cv2.COLOR_BGR2RGB)), timestamp_ms)
-            detections = []
-            display_markers = list(collector_markers)
-            seen_hands = set()
-            if result.hand_landmarks:
-                for hand_i, landmarks in enumerate(result.hand_landmarks):
-                    tip = landmarks[8]
-                    # Convert normalized enlarged-crop coordinates back to the
-                    # original full video frame before applying the homography.
-                    frame_x = crop_x + tip.x * hand_image.shape[1] / crop_scale
-                    frame_y = crop_y + tip.y * hand_image.shape[0] / crop_scale
-                    p = np.float32([[[frame_x, frame_y]]])
-                    mapped = cv2.perspectiveTransform(p, H_frame_to_map)[0, 0]
-                    margin_x, margin_y = 0.05 * ref_w, 0.05 * ref_h
-                    if (-margin_x <= mapped[0] < ref_w + margin_x and
-                            -margin_y <= mapped[1] < ref_h + margin_y):
-                        detections.append(mapped)
-                        handedness = result.handedness[hand_i][0].category_name
-                        display_markers.append(((int(round(frame_x)),
-                                                 int(round(frame_y))),
-                                                handedness))
-                        raw_paths.setdefault(handedness, []).append(
-                            tuple(np.rint(mapped).astype(int)))
-                        seen_hands.add(handedness)
-                        for name, box in symbol_boxes.items():
-                            update_symbol_timer(symbol_timers, symbol_stats, handedness,
-                                                in_box(mapped, box), timestamp_ms, name)
-            # A None creates a visible break rather than connecting across an
-            # interval in which MediaPipe did not actually see that hand.
-            for handedness, samples in raw_paths.items():
-                if (handedness not in seen_hands and samples and
-                        samples[-1] is not None):
-                    samples.append(None)
-            detection_count = len(detections)
-            assign_detections(tracks, detections)
 
         corners = np.asarray(drag_pts, np.float32)
         H_map_to_frame = cv2.getPerspectiveTransform(ref_corners, corners)
@@ -1565,7 +1376,8 @@ def manual_keyframe_tracking(video_path, reference_image_path,
                         "PAUSED: click/drag a corner; Space resumes",
                         (18, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                         (0, 255, 255), 2, cv2.LINE_AA)
-        collector.draw_trails_in_frame(shown, H_map_to_frame)
+        if show_wall_trace:
+            collector.draw_trails_in_frame(shown, H_map_to_frame)
         # Show only fingertips detected in this frame. Persisted/smoothed tracks
         # are for output traces and must not create a duplicate marker on one hand.
         for point, handedness in display_markers:
@@ -1574,8 +1386,6 @@ def manual_keyframe_tracking(video_path, reference_image_path,
             cv2.putText(shown, handedness[0], (point[0] + 10, point[1] - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
                         cv2.LINE_AA)
-        if show_edge_debug:
-            draw_edge_debug(shown, frame, corners, frame_w, frame_h)
         if show_edge_debug:
             draw_edge_debug(shown, frame, corners, frame_w, frame_h)
         if show_wall_trace:
@@ -1616,21 +1426,15 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     cv2.imwrite(output_path, final_canvas)
     session_log_path = os.path.splitext(output_path)[0] + ".session.json"
     collector.save_session_log(session_log_path)
+    final_timestamp_ms = int(round(1000.0 * frame_index / fps))
+    if collector.symbol_boxes:
+        stats_path = os.path.splitext(video_path)[0] + ".symbol_stats.json"
+        collector.save_symbol_stats(stats_path, final_timestamp_ms)
     collector.close()
     cap.release()
     cv2.destroyAllWindows()
     print(f"Saved {output_path}")
     print(f"Saved {session_log_path}")
-
-    # close out any symbol dwell timers still open when the video ended/quit
-    final_timestamp_ms = int(round(1000.0 * frame_index / fps))
-    for (handedness, symbol), start in list(symbol_timers.items()):
-        entry = symbol_stats.setdefault(symbol, {"visits": 0, "total_ms": 0})
-        entry["visits"] += 1
-        entry["total_ms"] += final_timestamp_ms - start
-    if symbol_boxes:
-        stats_path = os.path.splitext(video_path)[0] + ".symbol_stats.json"
-        save_symbol_stats(symbol_stats, stats_path)
 
 
 if __name__ == "__main__":

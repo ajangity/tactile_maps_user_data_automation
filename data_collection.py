@@ -17,6 +17,7 @@ it is exact under rotation and perspective/tilt changes, not just sliding.
 """
 
 import json
+import os
 
 import cv2
 import mediapipe as mp
@@ -27,7 +28,6 @@ from mediapipe.tasks.python import vision
 FINGER_SMOOTHING = 0.35          # lower = smoother
 MAX_FINGER_JUMP = 140.0          # map pixels; rejects detections after occlusion
 MAX_MISSED_FRAMES = 20
-STAIRS_BOX_FRAC = (0.05, 0.05, 0.95, 0.95)  # wide test box for tonight, shrink once we know real stairs coords
 
 
 def create_hand_landmarker(model_path="hand_landmarker.task"):
@@ -143,14 +143,33 @@ def in_box(pt, box):
     return x0 <= pt[0] <= x1 and y0 <= pt[1] <= y1
 
 
-def update_symbol_timer(state, handedness, in_region, timestamp_ms, symbol="stairs"):
-    # start/stop per hand per symbol, prints when it fires
+def load_symbol_boxes(map_path, ref_w, ref_h):
+    """Named symbol regions in ref-map pixel space, from label_symbols.py's
+    <map>.symbols.json (each symbol labeled once on the key, not per video)."""
+    json_path = os.path.splitext(map_path)[0] + ".symbols.json"
+    if not os.path.exists(json_path):
+        print(f"No {json_path} -- run label_symbols.py on this map first. "
+              "Continuing without symbol stats.")
+        return {}
+    with open(json_path) as f:
+        fractions = json.load(f)
+    print(f"Loaded {len(fractions)} symbol(s) from {json_path}")
+    return {name: (fx0 * ref_w, fy0 * ref_h, fx1 * ref_w, fy1 * ref_h)
+            for name, (fx0, fy0, fx1, fy1) in fractions.items()}
+
+
+def update_symbol_timer(state, stats, handedness, in_region, timestamp_ms, symbol):
+    # start/stop per hand per symbol; closed intervals roll into stats as a
+    # visit count + total dwell time.
     key = (handedness, symbol)
     if in_region and key not in state:
         state[key] = timestamp_ms
         print(f"[{symbol}] {handedness} start {timestamp_ms}ms")
     elif not in_region and key in state:
         start = state.pop(key)
+        entry = stats.setdefault(symbol, {"visits": 0, "total_ms": 0})
+        entry["visits"] += 1
+        entry["total_ms"] += timestamp_ms - start
         print(f"[{symbol}] {handedness} stop {timestamp_ms}ms, dur {timestamp_ms - start}ms")
 
 
@@ -189,18 +208,19 @@ class FingerDataCollector:
     """
 
     def __init__(self, ref_w, ref_h, model_path="hand_landmarker.task",
-                stairs_box_frac=STAIRS_BOX_FRAC):
+                symbol_boxes=None):
         self.ref_w = ref_w
         self.ref_h = ref_h
         self.ref_corners = np.float32([[0, 0], [ref_w - 1, 0],
                                        [ref_w - 1, ref_h - 1], [0, ref_h - 1]])
-        self.stairs_box = (stairs_box_frac[0] * ref_w, stairs_box_frac[1] * ref_h,
-                           stairs_box_frac[2] * ref_w, stairs_box_frac[3] * ref_h)
+        # label_symbols.py regions in ref-map pixels; empty = no symbol stats
+        self.symbol_boxes = symbol_boxes or {}
         self.detector = create_hand_landmarker(model_path)
         self.tracks = []
         self.raw_paths = {"Left": [], "Right": []}
         self.session_log = []
         self.symbol_timers = {}
+        self.symbol_stats = {}
 
     def update(self, frame, corners, frame_index, timestamp_ms):
         """Detect fingertips in this frame and record them. Returns
@@ -243,8 +263,10 @@ class FingerDataCollector:
                         "frame_x": float(frame_x), "frame_y": float(frame_y),
                         "map_x": float(mapped[0]), "map_y": float(mapped[1]),
                     }
-                    update_symbol_timer(self.symbol_timers, handedness,
-                                        in_box(mapped, self.stairs_box), timestamp_ms)
+                    for name, box in self.symbol_boxes.items():
+                        update_symbol_timer(self.symbol_timers, self.symbol_stats,
+                                            handedness, in_box(mapped, box),
+                                            timestamp_ms, name)
         # A None creates a visible break rather than connecting across an
         # interval in which MediaPipe did not actually see that hand.
         for handedness, samples in self.raw_paths.items():
@@ -283,6 +305,20 @@ class FingerDataCollector:
     def save_session_log(self, path):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.session_log, f, indent=2)
+
+    def save_symbol_stats(self, path, final_timestamp_ms):
+        # close out any dwell timers still open when the video ended/quit
+        for (handedness, symbol), start in list(self.symbol_timers.items()):
+            entry = self.symbol_stats.setdefault(symbol, {"visits": 0, "total_ms": 0})
+            entry["visits"] += 1
+            entry["total_ms"] += final_timestamp_ms - start
+        self.symbol_timers.clear()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.symbol_stats, f, indent=2)
+        print(f"Saved {path}")
+        for symbol, entry in sorted(self.symbol_stats.items(),
+                                    key=lambda kv: -kv[1]["total_ms"]):
+            print(f"  {symbol}: {entry['visits']} visit(s), {entry['total_ms']}ms total")
 
     def close(self):
         self.detector.close()

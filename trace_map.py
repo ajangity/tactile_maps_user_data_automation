@@ -5,6 +5,7 @@ directly, or a video frame already warped into map space via the tracker's
 own homography (see finger_tracking_manual_objects.py). Same pipeline
 either way -- only the input image changes.
 """
+import os
 import sys
 
 import cv2
@@ -78,12 +79,15 @@ def main():
         print("usage: python3 trace_map.py <image.png> [output.png]")
         sys.exit(1)
     image_path = sys.argv[1]
-    out_path = sys.argv[2] if len(sys.argv) > 2 else "traced_" + image_path.split("/")[-1]
+    out_path = (sys.argv[2] if len(sys.argv) > 2
+                else "traced_" + os.path.basename(image_path))
 
     raw = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
     if raw is None:
         raise FileNotFoundError(image_path)
-    if raw.shape[2] == 4:
+    if raw.ndim == 2:
+        img = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+    elif raw.shape[2] == 4:
         bgr, a = raw[:, :, :3].astype(np.float32), raw[:, :, 3:4].astype(np.float32) / 255.0
         img = (bgr * a + 255.0 * (1 - a)).astype(np.uint8)
     else:
