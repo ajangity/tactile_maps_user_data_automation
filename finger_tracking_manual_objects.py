@@ -20,9 +20,6 @@ MAX_REPROJECTION_ERROR = 3.0     # pixels in the video frame
 MAX_FRAME_MOTION = 0.12          # fraction of frame diagonal per frame
 PAGE_POSE_SMOOTHING = 0.65       # high = responsive; lower if the camera is noisy
 DEFAULT_PLAYBACK_SPEED = 1.5     # processes every frame; only display timing changes
-MAX_FRAME_MOTION = 0.12          # fraction of frame diagonal per frame
-PAGE_POSE_SMOOTHING = 0.65       # high = responsive; lower if the camera is noisy
-DEFAULT_PLAYBACK_SPEED = 1.5     # processes every frame; only display timing changes
 FINGER_SMOOTHING = 0.35          # lower = smoother
 MAX_FINGER_JUMP = 140.0          # map pixels; rejects detections after occlusion
 MAX_MISSED_FRAMES = 20
@@ -195,6 +192,18 @@ def _paper_mask(frame_bgr):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     return mask
+
+
+def _ink_border_mask(frame_bgr):
+    """Binary mask of printed ink within the frame (trace_map.py's edge
+    tracing, reused here) -- the map's own printed border is a far higher-
+    contrast, more stable edge than the paper-vs-desk brightness boundary
+    _paper_mask relies on, which struggles when the desk is nearly as bright
+    as the page or a second sheet sits nearby. Used as a fallback candidate
+    mask in PaperEdgeDetector.track() when _paper_mask finds no valid quad,
+    feeding the exact same Hough line-fit/intersect pipeline in _fit_quad."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    return ink_mask(gray)
 
 
 def _isolate_candidate_components(mask, roi_bounds, prior_center,
@@ -593,6 +602,21 @@ class PaperEdgeDetector:
             if strict and np.max(step) > EDGE_MAX_FRAME_MOTION * math.hypot(w, h):
                 continue
             results.append((quad, lines, visible))
+
+        if not results:
+            # _paper_mask found nothing usable this frame (desk and page too
+            # close in brightness, a second sheet bridging the blob, etc.) --
+            # retry the same ROI against the map's own printed ink border
+            # instead, through the identical _fit_quad line-fit/intersect
+            # pipeline. Only tried when the primary path came up empty, so
+            # this can only add successful locks, never override one.
+            ink_crop = _ink_border_mask(frame)[y0:y1, x0:x1]
+            quad, lines, visible = self._fit_quad(frame, ink_crop, x0, y0,
+                                                  prior_corners, self.last_valid)
+            if quad is not None:
+                step = np.linalg.norm(quad - p, axis=1)
+                if not strict or np.max(step) <= EDGE_MAX_FRAME_MOTION * math.hypot(w, h):
+                    results.append((quad, lines, visible))
         return results
 
     def confirm(self, lines):
@@ -1229,12 +1253,20 @@ def draw_edge_debug(shown, frame, corners, frame_w, frame_h):
                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
 
 
-def draw_wall_trace_debug(shown, frame, frame_h):
+def draw_wall_trace_debug(shown, frame, frame_h, corners):
     """Wall-line + symbol-blob trace over the raw frame (trace_map.py's
     pipeline), so which lines/blobs it's actually picking up is visible live
-    instead of only after the fact on a saved image."""
+    instead of only after the fact on a saved image.
+
+    Restricted to the tracked page's own pixel coordinates: everything
+    outside the quad is blanked out of the ink mask before tracing, so a
+    second sheet, a phone, the desk, etc. in frame can't produce a wall or
+    symbol blob."""
+    page_mask = np.zeros(frame.shape[:2], np.uint8)
+    cv2.fillConvexPoly(page_mask, np.int32(corners), 255)
+
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    mask = ink_mask(gray)
+    mask = cv2.bitwise_and(ink_mask(gray), page_mask)
     walls = trace_walls(mask)
     wall_mask = np.zeros_like(mask)
     for x1, y1, x2, y2 in walls:
@@ -1389,7 +1421,7 @@ def manual_keyframe_tracking(video_path, reference_image_path,
         if show_edge_debug:
             draw_edge_debug(shown, frame, corners, frame_w, frame_h)
         if show_wall_trace:
-            draw_wall_trace_debug(shown, frame, frame_h)
+            draw_wall_trace_debug(shown, frame, frame_h, corners)
         show_scaled("Video Tracker", shown)
         if is_paused:
             wait_ms = 10
