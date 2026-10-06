@@ -1,3 +1,16 @@
+"""One-time labeling tool: click boxes on the reference map PNG and mark
+each one "symbol" (a legend icon) or "room" (a space the user's finger
+moves through). Names are auto-numbered ("Symbol 1", "Room 1", ...) -- no
+typing needed, just press 's' or 'r' then click the box's two opposite
+corners. Press 'u' to undo, 'd' when done. Saves <map>.symbols.json.
+
+Everything happens inside the image window via keyboard, with no blocking
+terminal input() call -- that was what made the window look "Not
+Responding" on macOS before: a GUI window whose event loop stops being
+pumped while Python waits on terminal input gets flagged unresponsive by
+the OS even though it isn't actually stuck. cv2.waitKey() alone keeps it
+pumped continuously.
+"""
 import json
 import sys
 import cv2
@@ -15,67 +28,101 @@ if img is None:
 img = cv2.rotate(img, cv2.ROTATE_180)  # matches how the tracker loads it
 h, w = img.shape[:2]
 
-boxes = {}
-current_name = None
+boxes = {}             # name -> {"type":, "box":}
+order = []              # insertion order, so undo removes the right one
+counts = {"symbol": 0, "room": 0}
+pending_type = None     # "symbol" or "room" while mid-click, else None
 clicks = []
+
+TYPE_COLORS = {"symbol": (0, 255, 0), "room": (255, 180, 0)}
 
 
 def redraw():
     shown = img.copy()
-    for name, (fx0, fy0, fx1, fy1) in boxes.items():
+    for name, entry in boxes.items():
+        fx0, fy0, fx1, fy1 = entry["box"]
+        color = TYPE_COLORS[entry["type"]]
         p0 = (int(fx0 * w), int(fy0 * h))
         p1 = (int(fx1 * w), int(fy1 * h))
-        cv2.rectangle(shown, p0, p1, (0, 255, 0), 2)
+        cv2.rectangle(shown, p0, p1, color, 2)
         cv2.putText(shown, name, (p0[0], p0[1] - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-    prompt = f"labeling: {current_name}" if current_name else "type a symbol name in the terminal"
-    cv2.putText(shown, prompt, (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    if pending_type:
+        prompt = (f"click 2 opposite corners for the next {pending_type} "
+                 f"({len(clicks)}/2 so far)")
+    else:
+        prompt = "s = new symbol box   r = new room box   u = undo   d = done"
+    cv2.putText(shown, prompt, (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                 (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.putText(shown, f"{counts['symbol']} symbol(s), {counts['room']} room(s) so far",
+                (18, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
     cv2.imshow("label_symbols", shown)
+
+
+def finish_box():
+    global pending_type, clicks
+    (x0, y0), (x1, y1) = clicks
+    counts[pending_type] += 1
+    name = f"{pending_type.capitalize()} {counts[pending_type]}"
+    boxes[name] = {
+        "type": pending_type,
+        "box": (min(x0, x1) / w, min(y0, y1) / h,
+                max(x0, x1) / w, max(y0, y1) / h),
+    }
+    order.append(name)
+    print(f"  saved {name}")
+    pending_type = None
+    clicks = []
+
+
+def undo():
+    global pending_type, clicks
+    if pending_type is not None:
+        # cancel an in-progress box rather than undo an already-finished one
+        pending_type = None
+        clicks = []
+        print("  cancelled in-progress box")
+        return
+    if not order:
+        return
+    name = order.pop()
+    entry = boxes.pop(name)
+    counts[entry["type"]] -= 1
+    print(f"  undid {name}")
 
 
 def on_click(event, x, y, flags, param):
     global clicks
-    if event != cv2.EVENT_LBUTTONDOWN or current_name is None:
+    if event != cv2.EVENT_LBUTTONDOWN or pending_type is None:
         return
     clicks.append((x, y))
-    print(f"  clicked ({x}, {y})")
     if len(clicks) == 2:
-        (x0, y0), (x1, y1) = clicks
-        boxes[current_name] = (min(x0, x1) / w, min(y0, y1) / h,
-                               max(x0, x1) / w, max(y0, y1) / h)
-        print(f"  saved box for '{current_name}'")
-        clicks = []
-    redraw()
+        finish_box()
 
 
 cv2.namedWindow("label_symbols", cv2.WINDOW_AUTOSIZE)
 cv2.setMouseCallback("label_symbols", on_click)
-redraw()
 
-print("For each symbol: type its name and press Enter, then click its two opposite")
-print("corners in the image window. Type 'done' when finished.")
+print("s = start a symbol box, r = start a room box, then click its two opposite")
+print("corners in the image window. u = undo, d = done. Names are auto-numbered.")
 
 while True:
     redraw()
     key = cv2.waitKey(20) & 0xFF
-    if key == 13 or key == 10:  # Enter in the terminal doesn't reach cv2, this
-        pass                    # loop only exists to keep the window responsive
-    name = input("symbol name (or 'done'): ").strip()
-    if name.lower() == "done":
+    if key == ord("s") and pending_type is None:
+        pending_type = "symbol"
+        clicks = []
+    elif key == ord("r") and pending_type is None:
+        pending_type = "room"
+        clicks = []
+    elif key == ord("u"):
+        undo()
+    elif key == ord("d"):
         break
-    if not name:
-        continue
-    current_name = name
-    clicks = []
-    redraw()
-    print(f"click the two opposite corners of '{name}' in the image window")
-    while len(clicks) < 2:
-        cv2.waitKey(20)
-    current_name = None
 
 cv2.destroyAllWindows()
 
 with open(out_path, "w") as f:
     json.dump(boxes, f, indent=2)
-print(f"\nSaved {len(boxes)} symbol(s) to {out_path}")
+print(f"\nSaved {len(boxes)} box(es) to {out_path} "
+      f"({counts['symbol']} symbol(s), {counts['room']} room(s))")

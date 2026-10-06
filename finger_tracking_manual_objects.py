@@ -601,7 +601,7 @@ class PaperEdgeDetector:
             step = np.linalg.norm(quad - p, axis=1)
             if strict and np.max(step) > EDGE_MAX_FRAME_MOTION * math.hypot(w, h):
                 continue
-            results.append((quad, lines, visible))
+            results.append((quad, lines, visible, "paper"))
 
         if not results:
             # _paper_mask found nothing usable this frame (desk and page too
@@ -616,7 +616,7 @@ class PaperEdgeDetector:
             if quad is not None:
                 step = np.linalg.norm(quad - p, axis=1)
                 if not strict or np.max(step) <= EDGE_MAX_FRAME_MOTION * math.hypot(w, h):
-                    results.append((quad, lines, visible))
+                    results.append((quad, lines, visible, "ink"))
         return results
 
     def confirm(self, lines):
@@ -1077,7 +1077,7 @@ class PagePose:
 
         edge_candidates = self.edge_detector.track(frame, self.corners, strict=trusted)
         best_quad, best_lines, best_score = None, None, -1
-        if len(edge_candidates) == 1 and trusted:
+        if len(edge_candidates) == 1 and trusted and edge_candidates[0][3] == "paper":
             # Nothing to disambiguate (only one paper-colored blob found),
             # and the current lock is already trusted -- SIFT content
             # verification here would just be re-confirming what continuity
@@ -1085,13 +1085,15 @@ class PagePose:
             # corners) already established. This is the common case (~2/3
             # of frames in testing) and full SIFT verification is expensive
             # (profiled as the dominant per-frame cost by a wide margin), so
-            # skip it. Multiple candidates, or a lock we don't already
-            # trust, still get scored below -- that's exactly when picking
-            # the wrong one is actually a risk.
+            # skip it. Multiple candidates, a lock we don't already trust, or
+            # a candidate that only exists because _paper_mask found nothing
+            # this frame (source "ink") still get scored below -- a fallback
+            # candidate is inherently less certain than the primary method
+            # agreeing with itself, so it has to earn its lock too.
             best_quad, best_lines, best_score = (*edge_candidates[0][:2],
                                                  EDGE_VERIFY_MIN_MATCHES)
         else:
-            for quad, lines, _visible in edge_candidates:
+            for quad, lines, _visible, _source in edge_candidates:
                 # A shape-valid quad (right aspect ratio, ~90 degree corners)
                 # can still be positionally wrong, e.g. a shadow or crease
                 # that happened to read as a straight edge, or genuinely be
@@ -1308,8 +1310,9 @@ def manual_keyframe_tracking(video_path, reference_image_path,
                                  ref_w / float(ref_h))
     if auto_quad is not None:
         drag_pts = auto_quad.tolist()
-        print("Automatically located the page corners from its visible edges. "
-              "Press Enter to accept, or drag a corner to correct it first.")
+        print("Automatically located the page corners -- starting tracking "
+              "automatically, no confirmation needed. Press 'q' during "
+              "tracking if you want to stop and fix the corners by hand.")
     else:
         drag_pts = [[100, 100], [frame_w - 100, 100],
                     [frame_w - 100, frame_h - 100], [100, frame_h - 100]]
@@ -1325,30 +1328,33 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     cv2.resizeWindow("Video Tracker", frame_w, frame_h)
     cv2.setMouseCallback("Video Tracker", mouse_handler)
     ui_mode = "align"
-    while True:
-        shown = frame.copy()
-        corners = np.asarray(drag_pts, np.float32)
-        H = cv2.getPerspectiveTransform(ref_corners, corners)
-        overlay = cv2.warpPerspective(ref_img, H, (frame_w, frame_h))
-        mask = cv2.warpPerspective(np.full((ref_h, ref_w), 255, np.uint8), H,
-                                   (frame_w, frame_h))
-        blended = cv2.addWeighted(shown, 0.55, overlay, 0.45, 0)
-        shown[mask > 0] = blended[mask > 0]
-        for p in drag_pts:
-            cv2.circle(shown, tuple(np.int32(p)), 8, (0, 255, 0), -1)
-        cv2.polylines(shown, [corners.astype(np.int32)], True,
-                      (0, 255, 0), 2, cv2.LINE_AA)
-        align_msg = ("Auto-located: press Enter to accept, or drag a corner to fix"
-                    if auto_quad is not None else
-                    "Click/drag each map corner, then press Enter")
-        cv2.putText(shown, align_msg, (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (0, 255, 0), 2, cv2.LINE_AA)
-        show_scaled("Video Tracker", shown)
-        key = cv2.waitKey(20) & 0xFF
-        if key in (10, 13):
-            break
-        if key == ord("q"):
-            cap.release(); cv2.destroyAllWindows(); return
+    if auto_quad is None:
+        # A human has to place the corners by hand here -- there's no way
+        # around that when auto-detection couldn't find the page at all.
+        # When it *did* find it, this whole block is skipped, so the exact
+        # same command runs start-to-finish with nobody at the keyboard.
+        while True:
+            shown = frame.copy()
+            corners = np.asarray(drag_pts, np.float32)
+            H = cv2.getPerspectiveTransform(ref_corners, corners)
+            overlay = cv2.warpPerspective(ref_img, H, (frame_w, frame_h))
+            mask = cv2.warpPerspective(np.full((ref_h, ref_w), 255, np.uint8), H,
+                                       (frame_w, frame_h))
+            blended = cv2.addWeighted(shown, 0.55, overlay, 0.45, 0)
+            shown[mask > 0] = blended[mask > 0]
+            for p in drag_pts:
+                cv2.circle(shown, tuple(np.int32(p)), 8, (0, 255, 0), -1)
+            cv2.polylines(shown, [corners.astype(np.int32)], True,
+                          (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(shown, "Click/drag each map corner, then press Enter",
+                       (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                       (0, 255, 0), 2, cv2.LINE_AA)
+            show_scaled("Video Tracker", shown)
+            key = cv2.waitKey(20) & 0xFF
+            if key in (10, 13):
+                break
+            if key == ord("q"):
+                cap.release(); cv2.destroyAllWindows(); return
 
     pose = PagePose(ref_img, frame, drag_pts)
     collector = FingerDataCollector(
@@ -1460,8 +1466,8 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     collector.save_session_log(session_log_path)
     final_timestamp_ms = int(round(1000.0 * frame_index / fps))
     if collector.symbol_boxes:
-        stats_path = os.path.splitext(video_path)[0] + ".symbol_stats.json"
-        collector.save_symbol_stats(stats_path, final_timestamp_ms)
+        stats_path = os.path.splitext(video_path)[0] + ".dashboard.json"
+        collector.save_dashboard_data(stats_path, final_timestamp_ms, reference_image_path)
     collector.close()
     cap.release()
     cv2.destroyAllWindows()

@@ -28,6 +28,7 @@ from mediapipe.tasks.python import vision
 FINGER_SMOOTHING = 0.35          # lower = smoother
 MAX_FINGER_JUMP = 140.0          # map pixels; rejects detections after occlusion
 MAX_MISSED_FRAMES = 20
+MIN_VISIT_MS = 1000              # a dwell shorter than this isn't a real "visit"
 
 
 def create_hand_landmarker(model_path="hand_landmarker.task"):
@@ -144,33 +145,50 @@ def in_box(pt, box):
 
 
 def load_symbol_boxes(map_path, ref_w, ref_h):
-    """Named symbol regions in ref-map pixel space, from label_symbols.py's
-    <map>.symbols.json (each symbol labeled once on the key, not per video)."""
+    """Named box regions (symbols + rooms) in ref-map pixel space, from
+    label_symbols.py's <map>.symbols.json. Each entry carries a "type"
+    ("symbol" or "room") alongside its box -- any number of each, not a
+    fixed count, each becoming its own independent dwell timer below."""
     json_path = os.path.splitext(map_path)[0] + ".symbols.json"
     if not os.path.exists(json_path):
         print(f"No {json_path} -- run label_symbols.py on this map first. "
-              "Continuing without symbol stats.")
+              "Continuing without box stats.")
         return {}
     with open(json_path) as f:
-        fractions = json.load(f)
-    print(f"Loaded {len(fractions)} symbol(s) from {json_path}")
-    return {name: (fx0 * ref_w, fy0 * ref_h, fx1 * ref_w, fy1 * ref_h)
-            for name, (fx0, fy0, fx1, fy1) in fractions.items()}
+        raw = json.load(f)
+    boxes = {}
+    for name, entry in raw.items():
+        fx0, fy0, fx1, fy1 = entry["box"]
+        boxes[name] = {
+            "type": entry["type"],
+            "box": (fx0 * ref_w, fy0 * ref_h, fx1 * ref_w, fy1 * ref_h),
+        }
+    n_symbols = sum(1 for e in boxes.values() if e["type"] == "symbol")
+    n_rooms = sum(1 for e in boxes.values() if e["type"] == "room")
+    print(f"Loaded {len(boxes)} box(es) from {json_path} "
+          f"({n_symbols} symbol(s), {n_rooms} room(s))")
+    return boxes
 
 
 def update_symbol_timer(state, stats, handedness, in_region, timestamp_ms, symbol):
-    # start/stop per hand per symbol; closed intervals roll into stats as a
-    # visit count + total dwell time.
+    # start/stop per hand per box; closed intervals roll into stats as a
+    # visit count + total dwell time, but only once they clear MIN_VISIT_MS --
+    # a shorter touch doesn't count as a real visit, just passing over it.
+    # "entered" is separate and set the instant the finger is in the box at
+    # all, regardless of duration, so a box that was only ever brushed isn't
+    # reported as having been missed entirely.
+    entry = stats[symbol]
     key = (handedness, symbol)
-    if in_region and key not in state:
-        state[key] = timestamp_ms
-        print(f"[{symbol}] {handedness} start {timestamp_ms}ms")
-    elif not in_region and key in state:
+    if in_region:
+        entry["entered"] = True
+        if key not in state:
+            state[key] = timestamp_ms
+    elif key in state:
         start = state.pop(key)
-        entry = stats.setdefault(symbol, {"visits": 0, "total_ms": 0})
-        entry["visits"] += 1
-        entry["total_ms"] += timestamp_ms - start
-        print(f"[{symbol}] {handedness} stop {timestamp_ms}ms, dur {timestamp_ms - start}ms")
+        duration = timestamp_ms - start
+        if duration >= MIN_VISIT_MS:
+            entry["visits"] += 1
+            entry["total_ms"] += duration
 
 
 def draw_trail(canvas, samples, color):
@@ -213,14 +231,18 @@ class FingerDataCollector:
         self.ref_h = ref_h
         self.ref_corners = np.float32([[0, 0], [ref_w - 1, 0],
                                        [ref_w - 1, ref_h - 1], [0, ref_h - 1]])
-        # label_symbols.py regions in ref-map pixels; empty = no symbol stats
+        # label_symbols.py regions in ref-map pixels; empty = no box stats
         self.symbol_boxes = symbol_boxes or {}
         self.detector = create_hand_landmarker(model_path)
         self.tracks = []
         self.raw_paths = {"Left": [], "Right": []}
         self.session_log = []
         self.symbol_timers = {}
-        self.symbol_stats = {}
+        self.symbol_stats = {
+            name: {"type": entry["type"], "entered": False,
+                  "visits": 0, "total_ms": 0}
+            for name, entry in self.symbol_boxes.items()
+        }
 
     def update(self, frame, corners, frame_index, timestamp_ms):
         """Detect fingertips in this frame and record them. Returns
@@ -263,9 +285,9 @@ class FingerDataCollector:
                         "frame_x": float(frame_x), "frame_y": float(frame_y),
                         "map_x": float(mapped[0]), "map_y": float(mapped[1]),
                     }
-                    for name, box in self.symbol_boxes.items():
+                    for name, entry in self.symbol_boxes.items():
                         update_symbol_timer(self.symbol_timers, self.symbol_stats,
-                                            handedness, in_box(mapped, box),
+                                            handedness, in_box(mapped, entry["box"]),
                                             timestamp_ms, name)
         # A None creates a visible break rather than connecting across an
         # interval in which MediaPipe did not actually see that hand.
@@ -306,19 +328,69 @@ class FingerDataCollector:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.session_log, f, indent=2)
 
-    def save_symbol_stats(self, path, final_timestamp_ms):
+    def get_path_points(self, handedness):
+        """Lightweight (x, y, t_ms) polyline for `handedness`, extracted from
+        the full per-frame session log -- a None marks a real gap (the hand
+        wasn't seen that frame) rather than connecting across it, same as
+        the on-screen trail. This is what a dashboard would actually plot."""
+        points = []
+        for record in self.session_log:
+            pos = record.get(handedness)
+            if pos is None:
+                points.append(None)
+            else:
+                points.append({"x": pos["map_x"], "y": pos["map_y"],
+                               "t_ms": record["t_ms"]})
+        return points
+
+    def save_dashboard_data(self, path, final_timestamp_ms, map_path):
+        """One consolidated, dashboard-ready JSON: every labeled box with its
+        type, pixel coordinates, whether it was ever entered at all (so a
+        box nobody ever touched is reported as missed, not silently absent),
+        >=1s visit count + total dwell time, and each hand's full timestamped
+        path -- everything a dashboard needs without re-deriving anything
+        from the raw per-frame log."""
         # close out any dwell timers still open when the video ended/quit
         for (handedness, symbol), start in list(self.symbol_timers.items()):
-            entry = self.symbol_stats.setdefault(symbol, {"visits": 0, "total_ms": 0})
-            entry["visits"] += 1
-            entry["total_ms"] += final_timestamp_ms - start
+            duration = final_timestamp_ms - start
+            if duration >= MIN_VISIT_MS:
+                entry = self.symbol_stats[symbol]
+                entry["visits"] += 1
+                entry["total_ms"] += duration
         self.symbol_timers.clear()
+
+        boxes_out = {}
+        for name, box_entry in self.symbol_boxes.items():
+            stats = self.symbol_stats[name]
+            boxes_out[name] = {
+                "type": stats["type"],
+                "box_px": [round(v, 1) for v in box_entry["box"]],
+                "entered": stats["entered"],
+                "missed": not stats["entered"],
+                "visits": stats["visits"],
+                "total_ms": stats["total_ms"],
+            }
+
+        data = {
+            "map": os.path.basename(map_path),
+            "ref_w": self.ref_w,
+            "ref_h": self.ref_h,
+            "boxes": boxes_out,
+            "path": {
+                "Left": self.get_path_points("Left"),
+                "Right": self.get_path_points("Right"),
+            },
+        }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.symbol_stats, f, indent=2)
+            json.dump(data, f, indent=2)
         print(f"Saved {path}")
-        for symbol, entry in sorted(self.symbol_stats.items(),
-                                    key=lambda kv: -kv[1]["total_ms"]):
-            print(f"  {symbol}: {entry['visits']} visit(s), {entry['total_ms']}ms total")
+        missed = [n for n, b in boxes_out.items() if b["missed"]]
+        print(f"  {len(boxes_out) - len(missed)}/{len(boxes_out)} box(es) entered; "
+              f"missed: {missed if missed else 'none'}")
+        for name, b in sorted(boxes_out.items(), key=lambda kv: -kv[1]["total_ms"]):
+            print(f"  [{b['type']}] {name}: {b['visits']} visit(s) >=1s, "
+                  f"{b['total_ms']}ms total, entered={b['entered']}")
+        return data
 
     def close(self):
         self.detector.close()
