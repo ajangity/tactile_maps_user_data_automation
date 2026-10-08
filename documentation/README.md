@@ -2,6 +2,12 @@
 
 Tracks where a user's fingers go on a printed tactile map in a video, and reports how long they spent in each room and on each symbol.
 
+**More documentation in this folder:**
+- [`architecture.html`](architecture.html): an interactive diagram of every file, its inputs and outputs, layer by layer. Open it in a browser and click a box.
+- [`CODEBASE.md`](CODEBASE.md): the technical reference (modules, data formats, algorithms, settings, measured results, known limitations).
+
+Run every command below from the project folder (one level up from this file).
+
 ## Run it
 
 ```bash
@@ -11,7 +17,7 @@ python dashboard.py "data/<run folder>/dashboard.json"     # rebuild a dashboard
 python edge_tracing.py distractor_floorplan_E.png          # see what edge tracing finds
 ```
 
-Keys while the video plays: **Space** stops the video so you can fix the crop by hand, **t** shows trails and rooms, **e** shows the paper-edge debug view, **w** shows the edge-tracing debug view, **[ / ]** changes speed, and **q** saves and quits.
+Keys while the video plays: **c** shows or hides the on-screen list of commands, **Space** stops the video so you can fix the crop by hand, **t** shows trails and rooms (then **l** / **r** turn the left / right trail on and off), **e** shows the paper-edge debug view, **w** shows the edge-tracing debug view, **[ / ]** changes speed, and **q** saves and quits.
 
 Requires `opencv-python`, `mediapipe`, `numpy`, and `hand_landmarker.task` in this folder.
 
@@ -109,7 +115,7 @@ All map coordinates are the PNG's own pixels, in the PNG's own orientation.
 21. The paper is rigid: if 3 corners stayed put and 1 jumped, the jump is corrected. Each corner is drawn green if it's visible and orange if it's covered.
 22. The script crops around the paper plus some margin, enlarges the crop up to 2.5×, and runs MediaPipe for the index fingertip of up to 2 hands.
 23. The fingertip goes crop → frame → PNG pixels, through a homography built fresh every frame from that frame's corners. It's marked `on_paper` if it lands on the map. The trail breaks instead of drawing a straight line across any jump over 140 px.
-24. Each tip is matched to whichever hand was closest last frame, solving both hands together. Then it's labeled Left/Right by that hand's running majority of MediaPipe's guesses, so one bad frame can't swap them.
+24. Each hand is matched to whichever hand's wrist was closest last frame, solving both hands together. Then it's labeled Left/Right from a short, fading memory of MediaPipe's own Left/Right calls, weighted by MediaPipe's confidence. One low-confidence frame can't swap the labels, and a wrong label can't stick (MediaPipe's labels are reliable for a camera across the table).
 25. **Timers** (`timing.py`): one for the paper, one per room, and one per symbol (plus any boxes drawn with `label_symbols.py`). Every timer works the same way:
     - **Start:** a finger enters the room's exact pixels.
     - **End:** no finger has been in it for 0.4 s, either because it left or because the hand vanished. The visit ends at the last moment a finger was actually inside.

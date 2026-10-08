@@ -9,14 +9,29 @@ Step 23  map the fingertip       -- crop pixels -> frame pixels -> map
                                     corners (nothing carries over, so
                                     nothing accumulates error). Each tip is
                                     flagged on_paper if it lands on the map.
-Step 24  hand identity           -- match each tip to whichever hand was
-                                    closest last frame (both hands solved
-                                    together), then label Left/Right by each
-                                    hand's running majority of MediaPipe's
-                                    guesses, so one bad frame can't swap them.
+Step 24  hand identity           -- match each hand to whichever hand's
+                                    wrist was closest last frame (both hands
+                                    solved together), then label Left/Right
+                                    from a short, fading, confidence-weighted
+                                    memory of MediaPipe's own Left/Right calls.
+                                    One low-confidence frame can't swap the
+                                    labels, and a wrong label can't stick.
+
+About MediaPipe's Left/Right: the hand landmark model labels every hand,
+every frame, from that hand's own image (it doesn't track identity). It
+assumes a mirrored, selfie-style image. A camera across the table looking
+at the backs of the hands gives the same handedness as a mirrored selfie,
+so its labels are right as they come. On S-19_Elevator.mp4 they were right
+for 3588 of 3592 two-hand detections. So step 24 follows MediaPipe and only
+smooths over its occasional low-confidence flips. Don't replace its labels
+with a long-running vote: if the two tracks swap hands once, a vote like
+that keeps the wrong labels for minutes. If a recording is mirrored, every
+label will come out swapped.
 
 All coordinates on the map are the PNG's own pixels.
 """
+
+import itertools
 
 import cv2
 import mediapipe as mp
@@ -24,9 +39,9 @@ import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-FINGER_SMOOTHING = 0.35      # smoothing of each hand's identity-tracking point
-MAX_FINGER_JUMP = 140.0      # map px; a bigger jump isn't the same hand (unless it's been gone a while)
-MAX_MISSED_FRAMES = 20
+LABEL_MEMORY = 0.7           # per frame: share of a hand's Left/Right evidence kept from last frame
+MAX_WRIST_JUMP = 200.0       # map px; a wrist moving further than this between frames is a new hand
+MAX_MISSED_FRAMES = 15       # a hand unseen this many frames is forgotten (label memory and all)
 PATH_MARGIN = 0.05           # tips this close outside the map (fraction of its size) still draw on the trail
 TRACK_MARGIN = 0.50          # tips further out than this are ignored entirely
 PATH_BREAK_JUMP = 140.0      # map px; a trail never draws a straight line across a jump this
@@ -69,92 +84,63 @@ def hand_crop(frame, corners):
 # ---------------------------------------------------------------- step 24
 
 class HandTrack:
-    """One physical hand: a smoothed position for matching, plus a running
-    tally of MediaPipe's Left/Right guesses for it."""
+    """One physical hand: where its wrist was last frame, and a short,
+    fading memory of MediaPipe's Left/Right calls for it."""
 
-    def __init__(self, point):
-        self.point = np.asarray(point, np.float32)
+    def __init__(self, wrist):
+        self.wrist = wrist
         self.missed = 0
-        self.votes = {"Left": 0, "Right": 0}
+        self.evidence = 0.0      # > 0 leans Left, < 0 leans Right
 
-    def update(self, point):
-        point = np.asarray(point, np.float32)
-        if np.linalg.norm(point - self.point) > MAX_FINGER_JUMP and self.missed <= MAX_MISSED_FRAMES:
-            self.miss()
-            return
-        jumped = np.linalg.norm(point - self.point) > MAX_FINGER_JUMP
-        self.point = point if jumped else (
-            (1 - FINGER_SMOOTHING) * self.point + FINGER_SMOOTHING * point)
+    def update(self, wrist, label, score):
+        """score is MediaPipe's handedness confidence: a 0.55 call barely
+        counts, a 0.99 call counts fully. Old calls fade by LABEL_MEMORY each
+        frame, so if this track ever ends up on the other hand, the label
+        follows MediaPipe again within a couple of frames."""
+        self.wrist = wrist
         self.missed = 0
-
-    def miss(self):
-        self.missed += 1
-
-    def lean(self):
-        """> 0 leans Left, < 0 leans Right."""
-        return self.votes["Left"] - self.votes["Right"]
+        vote = 2.0 * score - 1.0
+        self.evidence = LABEL_MEMORY * self.evidence + (vote if label == "Left" else -vote)
 
 
-def assign_detections(tracks, detections):
-    """owners[j] = the HandTrack detection j belongs to (or None).
-    Matched by position, never by MediaPipe's label."""
-    owners = [None] * len(detections)
-    if not tracks:
-        for j in sorted(range(len(detections)), key=lambda k: detections[k][0]):
-            owners[j] = HandTrack(detections[j])
-            tracks.append(owners[j])
-        return owners
-    if len(tracks) == 2 and len(detections) == 2:
-        # Solve both together, so one hand can't steal the other's detection.
-        direct = (np.linalg.norm(detections[0] - tracks[0].point) +
-                  np.linalg.norm(detections[1] - tracks[1].point))
-        crossed = (np.linalg.norm(detections[1] - tracks[0].point) +
-                   np.linalg.norm(detections[0] - tracks[1].point))
-        for track, j in zip(tracks, (0, 1) if direct <= crossed else (1, 0)):
-            track.update(detections[j])
-            owners[j] = track
-        return owners
-    if len(tracks) == 2 and len(detections) == 1:
-        k = min(range(2), key=lambda i: np.linalg.norm(detections[0] - tracks[i].point))
-        tracks[k].update(detections[0])
-        tracks[1 - k].miss()
-        owners[0] = tracks[k]
-        return owners
-    unused = set(range(len(detections)))
+def match_hands(tracks, wrists):
+    """owners[j] = the HandTrack wrist j belongs to. Both hands are solved
+    together (most matches, then least total movement); a wrist further
+    than MAX_WRIST_JUMP from every track starts a new one, and a track
+    unseen for MAX_MISSED_FRAMES is forgotten."""
+    dist = lambda j, k: float(np.linalg.norm(wrists[j] - tracks[k].wrist))
+    pairs = [(j, k) for j in range(len(wrists)) for k in range(len(tracks))
+             if dist(j, k) <= MAX_WRIST_JUMP]
+    options = [()] + [(p,) for p in pairs] + [
+        (p, q) for p, q in itertools.combinations(pairs, 2) if p[0] != q[0] and p[1] != q[1]]
+    best = min(options, key=lambda o: (-len(o), sum(dist(j, k) for j, k in o)))
+    owners = [None] * len(wrists)
+    for j, k in best:
+        owners[j] = tracks[k]
     for track in tracks:
-        if not unused:
-            track.miss()
-            continue
-        j = min(unused, key=lambda k: np.linalg.norm(detections[k] - track.point))
-        if np.linalg.norm(detections[j] - track.point) <= MAX_FINGER_JUMP:
-            track.update(detections[j])
-            owners[j] = track
-            unused.remove(j)
-        else:
-            track.miss()
-    for j in sorted(unused):
-        if len(tracks) < 2:
-            owners[j] = HandTrack(detections[j])
+        if track not in owners:
+            track.missed += 1
+    tracks[:] = [t for t in tracks if t.missed <= MAX_MISSED_FRAMES]
+    for j, owner in enumerate(owners):
+        if owner is None:
+            owners[j] = HandTrack(wrists[j])
             tracks.append(owners[j])
+    tracks.sort(key=lambda t: t.missed)    # at most 2 hands: drop the stalest
+    del tracks[2:]
     return owners
 
 
 def label_hands(owners, raw_labels):
-    """Stable Left/Right per detection from each hand's vote tally. Two
-    visible hands always get different labels; a tie falls back to this
-    frame's MediaPipe label."""
-    labels = [None] * len(owners)
-    active = [j for j, t in enumerate(owners) if t is not None]
-    if len(active) == 1:
-        j = active[0]
-        lean = owners[j].lean()
-        labels[j] = raw_labels[j] if lean == 0 else ("Left" if lean > 0 else "Right")
-    elif len(active) == 2:
-        a, b = active
-        diff = owners[a].lean() - owners[b].lean()
-        a_left = (raw_labels[a] == "Left" or raw_labels[b] == "Right") if diff == 0 else diff > 0
-        labels[a], labels[b] = ("Left", "Right") if a_left else ("Right", "Left")
-    return labels
+    """Left/Right per detection from each hand's evidence. Two visible hands
+    always get different labels (the one leaning more Left is Left); no
+    evidence at all falls back to this frame's MediaPipe label."""
+    if len(owners) == 1:
+        ev = owners[0].evidence
+        return [raw_labels[0] if ev == 0 else "Left" if ev > 0 else "Right"]
+    if len(owners) == 2:
+        a_left = owners[0].evidence > owners[1].evidence
+        return ["Left", "Right"] if a_left else ["Right", "Left"]
+    return []
 
 
 # ---------------------------------------------------------------- all together
@@ -208,23 +194,22 @@ class FingerTracker:
             data=cv2.cvtColor(image, cv2.COLOR_BGR2RGB)), timestamp_ms)
         found = []
         for i, landmarks in enumerate(result.hand_landmarks or []):
-            tip = landmarks[8]                                                  # index fingertip
-            fx = cx + tip.x * image.shape[1] / scale                            # step 23
-            fy = cy + tip.y * image.shape[0] / scale
-            mx, my = cv2.perspectiveTransform(np.float32([[[fx, fy]]]), H)[0, 0]
+            # index fingertip (8) and wrist (0): crop -> frame -> map         step 23
+            frame_pts = np.float32([[cx + landmarks[k].x * image.shape[1] / scale,
+                                     cy + landmarks[k].y * image.shape[0] / scale] for k in (8, 0)])
+            (mx, my), wrist = cv2.perspectiveTransform(frame_pts[None], H)[0]
+            fx, fy = frame_pts[0]
             if (-TRACK_MARGIN * self.ref_w <= mx <= (1 + TRACK_MARGIN) * self.ref_w and
                     -TRACK_MARGIN * self.ref_h <= my <= (1 + TRACK_MARGIN) * self.ref_h):
-                found.append((np.float32([mx, my]), float(fx), float(fy),
-                              result.handedness[i][0].category_name))
-        owners = assign_detections(self.tracks, [f[0] for f in found])          # step 24
+                category = result.handedness[i][0]
+                found.append((np.float32([mx, my]), float(fx), float(fy), wrist,
+                              category.category_name, category.score))
+        owners = match_hands(self.tracks, [f[3] for f in found])                # step 24
         for track, f in zip(owners, found):
-            if track is not None:
-                track.votes[f[3]] = track.votes.get(f[3], 0) + 1
-        labels = label_hands(owners, [f[3] for f in found])
+            track.update(f[3], f[4], f[5])
+        labels = label_hands(owners, [f[4] for f in found])
         tips = []
-        for (m, fx, fy, raw), hand in zip(found, labels):
-            if hand is None:
-                continue
+        for (m, fx, fy, _, raw, _), hand in zip(found, labels):
             tips.append({"hand": hand, "frame_x": round(fx, 1), "frame_y": round(fy, 1),
                          "map_x": round(float(m[0]), 1), "map_y": round(float(m[1]), 1),
                          "on_paper": bool(0 <= m[0] < self.ref_w and 0 <= m[1] < self.ref_h),
@@ -232,10 +217,13 @@ class FingerTracker:
         return tips
 
     # ------------------------------------------------------------ drawing
-    def draw_trails(self, canvas, H_map_to_canvas=None):
+    def draw_trails(self, canvas, H_map_to_canvas=None, hands=("Left", "Right")):
         """Left trail red, right trail blue -- on the map (H None) or on a
-        video frame (H = this frame's map -> frame homography)."""
+        video frame (H = this frame's map -> frame homography). hands picks
+        which trails to draw."""
         for hand, color in (("Left", (0, 0, 255)), ("Right", (255, 0, 0))):
+            if hand not in hands:
+                continue
             pts = self.paths[hand]
             if H_map_to_canvas is not None:
                 pts = _warp_points(pts, H_map_to_canvas)

@@ -16,8 +16,10 @@ What happens, in order (each step lives in its own file):
   dashboard.py       at the end: dashboard.json + dashboard.html
 
 Keys while the video plays:
+  c       show / hide the list of commands (on screen)
   Space   stop and fix the crop by hand (manual_crop.py)
   t       show trails + rooms on the video      e   paper-edge debug view
+  l / r   (while t is on) left / right trail on/off
   w       edge-tracing debug view               ] / [   faster / slower
   q       stop, save everything, quit
 """
@@ -69,6 +71,44 @@ def banner(shown, title, subtitle, row=0):
         cv2.putText(shown, title, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 255), 3, cv2.LINE_AA)
     cv2.putText(shown, subtitle, (20, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
                 cv2.LINE_AA)
+
+
+COMMANDS = [   # (key, what it does, the show / trail_hands entry it toggles, if any)
+    ("c", "show / hide this list of commands", None),
+    ("Space", "pause and drag the crop's corners by hand", None),
+    ("t", "trails, room outlines and symbol boxes on the video", "trails"),
+    ("l", "left finger's trail on / off (while t is on)", "Left"),
+    ("r", "right finger's trail on / off (while t is on)", "Right"),
+    ("e", "paper-edge debug view (paper mask, search window, edges)", "edges"),
+    ("w", "edge-tracing debug view (inside the crop)", "trace"),
+    ("] / [", "play faster / slower (every frame is still processed)", None),
+    ("q", "stop, save everything and quit", None),
+]
+
+
+def draw_commands(shown, open_, state):
+    """Top-right corner: a "press c" hint, or (once c is pressed) every key
+    and what it does, with the on/off state of the ones that toggle."""
+    font, scale, pad, line = cv2.FONT_HERSHEY_SIMPLEX, 0.6, 12, 30
+    if open_:
+        rows = [("Commands", "", None)] + [
+            (key, text + ("" if name is None else "   [on]" if state[name] else "   [off]"), name)
+            for key, text, name in COMMANDS]
+    else:
+        rows = [("", "Press c to view commands", None)]
+    key_w = max(cv2.getTextSize(k, font, scale, 2)[0][0] for k, _, _ in rows[open_:]) + (20 if open_ else 0)
+    text_w = max(cv2.getTextSize(t, font, scale, 1)[0][0] for _, t, _ in rows)
+    w, h = key_w + text_w + 2 * pad, len(rows) * line + pad
+    x0 = shown.shape[1] - w - 10
+    fill = shown.copy()
+    cv2.rectangle(fill, (x0, 10), (x0 + w, 10 + h), (0, 0, 0), -1)
+    cv2.addWeighted(fill, 0.75, shown, 0.25, 0, dst=shown)
+    for i, (key, text, name) in enumerate(rows):
+        y = 10 + pad + 15 + i * line
+        on = name is not None and state[name]
+        cv2.putText(shown, key, (x0 + pad, y), font, scale, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(shown, text, (x0 + pad + key_w, y), font, scale,
+                    (40, 255, 40) if on else (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def draw_regions(shown, H_map_to_frame, timing):
@@ -163,7 +203,8 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
     tracker = FingerTracker(ref.w, ref.h)
     timing = Timing(ref.rooms, load_manual_boxes(map_path, ref.w, ref.h))
     window = manual_crop.VideoWindow("Video Tracker", frame_w, frame_h) if display else None
-    show = {"trails": False, "edges": False, "trace": False}
+    show = {"trails": False, "edges": False, "trace": False, "commands": False}
+    trail_hands = {"Left": True, "Right": True}   # l / r, under t
     speed = DEFAULT_PLAYBACK_SPEED
     frame_index, timestamp_ms, tips = 0, 0, []
     print("Searching for the map..." + ("" if display else " (batch mode, no window)"))
@@ -194,7 +235,7 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
             draw_crop(shown, corners, H, ref, crop)
             if show["trails"]:
                 draw_regions(shown, H, timing)
-                tracker.draw_trails(shown, H)
+                tracker.draw_trails(shown, H, [h for h, on in trail_hands.items() if on])
             if show["edges"]:
                 draw_paper_debug(shown, frame, corners)
         else:
@@ -224,8 +265,16 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
         status = (f"crop: {crop.source} (score {crop.score:.2f}){sift}  hands: {len(tips)}  "
                   f"in: {inside}  speed: {speed:.2f}x   [Space] fix crop  [t] trails  [w] tracing  [q] quit")
         y = shown.shape[0] - 15
+        if show["trails"]:
+            trails = "trails:  " + "   ".join(f"{h} {'on' if on else 'off'}"
+                                            for h, on in trail_hands.items()) + "     [l] / [r] toggle"
+            (tw, _), _ = cv2.getTextSize(trails, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+            cv2.rectangle(shown, (0, y - 62), (tw + 28, y - 28), (0, 0, 0), -1)
+            cv2.putText(shown, trails, (14, y - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 255, 40), 2,
+                        cv2.LINE_AA)
         cv2.rectangle(shown, (0, y - 28), (shown.shape[1], shown.shape[0]), (0, 0, 0), -1)
         cv2.putText(shown, status, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 255, 40), 2, cv2.LINE_AA)
+        draw_commands(shown, show["commands"], {**show, **trail_hands})
         window.show(shown)
 
         wait = max(1, int(round(1000.0 / (fps * speed) - 1000.0 * (time.perf_counter() - started))))
@@ -240,8 +289,13 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
             speed = min(4.0, speed + 0.25)
         elif key in (ord("["), ord("-"), ord("_")):
             speed = max(0.25, speed - 0.25)
+        elif key == ord("c"):
+            show["commands"] = not show["commands"]
         elif key == ord("t"):
             show["trails"] = not show["trails"]
+        elif key in (ord("l"), ord("r")) and show["trails"]:
+            hand = "Left" if key == ord("l") else "Right"
+            trail_hands[hand] = not trail_hands[hand]
         elif key == ord("e"):
             show["edges"] = not show["edges"]
         elif key == ord("w"):

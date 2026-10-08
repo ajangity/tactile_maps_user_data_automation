@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pipeline Architecture</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee; --ink: #0b0b0b; --ink-2: #52514e;
+  --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.12);
+  --accent: #2a78d6; --accent-soft: rgba(42,120,214,0.12);
+  --input: #e4eefb; --input-stroke: #6da7ec;
+  --output: #def3ea; --output-stroke: #1baf7a;
+  --band: rgba(11,11,11,0.025); --loop: #eb6834;
+  --edge: #8f8d86; --code-bg: #efeee9;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222220; --ink: #ffffff; --ink-2: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.12);
+    --accent: #3987e5; --accent-soft: rgba(57,135,229,0.18);
+    --input: #16263b; --input-stroke: #3987e5;
+    --output: #12291f; --output-stroke: #199e70;
+    --band: rgba(255,255,255,0.025); --loop: #d95926;
+    --edge: #77756f; --code-bg: #262624;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222220; --ink: #ffffff; --ink-2: #c3c2b7;
+  --muted: #898781; --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.12);
+  --accent: #3987e5; --accent-soft: rgba(57,135,229,0.18);
+  --input: #16263b; --input-stroke: #3987e5;
+  --output: #12291f; --output-stroke: #199e70;
+  --band: rgba(255,255,255,0.025); --loop: #d95926;
+  --edge: #77756f; --code-bg: #262624;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1680px; margin: 0 auto; padding: 24px 16px 56px; }
+h1 { font-size: 24px; margin: 0 0 4px; font-weight: 650; }
+h2 { font-size: 17px; margin: 0 0 12px; font-weight: 650; }
+h3 { font-size: 13px; margin: 18px 0 6px; font-weight: 650; color: var(--ink-2);
+  text-transform: uppercase; letter-spacing: 0.04em; }
+p { margin: 0 0 10px; }
+.sub { color: var(--ink-2); margin: 0 0 18px; max-width: 900px; }
+code { font: 12.5px/1.4 ui-monospace, "Cascadia Code", Consolas, monospace;
+  background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.fact .label { color: var(--ink-2); font-size: 12.5px; }
+.fact .value { font-size: 22px; font-weight: 650; }
+.fact .note { color: var(--muted); font-size: 12px; }
+.layout { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(320px, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 1150px) { .layout { grid-template-columns: minmax(0, 1fr); } .panel { position: static; max-height: none; } }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--ink-2); font-size: 12.5px; margin-bottom: 10px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 18px; height: 12px; border-radius: 3px; display: inline-block; border: 1.5px solid var(--axis); background: var(--surface); }
+.sw.in { background: var(--input); border-color: var(--input-stroke); }
+.sw.out { background: var(--output); border-color: var(--output-stroke); }
+.sw.tool { border-style: dashed; }
+.ln { width: 26px; height: 0; border-top: 2px solid var(--edge); display: inline-block; }
+.ln.call { border-top-style: dashed; }
+.ln.loop { border-top: 2px dashed var(--loop); }
+.diagram-wrap { overflow-x: auto; }
+#diagram { display: block; width: 100%; min-width: 860px; height: auto; }
+#diagram .band { fill: var(--band); }
+#diagram .band-label { fill: var(--ink); font-size: 14px; font-weight: 650; }
+#diagram .band-sub { fill: var(--muted); font-size: 12px; }
+#diagram .node { cursor: pointer; }
+#diagram .node rect { fill: var(--surface); stroke: var(--axis); stroke-width: 1.5; transition: stroke 0.15s, fill 0.15s; }
+#diagram .node.input rect { fill: var(--input); stroke: var(--input-stroke); }
+#diagram .node.output rect { fill: var(--output); stroke: var(--output-stroke); }
+#diagram .node.tool rect { stroke-dasharray: 5 4; }
+#diagram .node .title { fill: var(--ink); font-size: 15px; font-weight: 650; }
+#diagram .node.chip .title { font-size: 13px; font-weight: 600; }
+#diagram .node .subtitle { fill: var(--ink-2); font-size: 12px; }
+#diagram .node:hover rect, #diagram .node:focus-visible rect { stroke: var(--accent); }
+#diagram .node:focus { outline: none; }
+#diagram .node.selected rect { stroke: var(--accent); stroke-width: 3; fill: var(--accent-soft); }
+#diagram.has-sel .node:not(.selected):not(.near) { opacity: 0.5; }
+#diagram .edge path { fill: none; stroke: var(--edge); stroke-width: 1.6; }
+#diagram .edge.call path { stroke-dasharray: 6 4; }
+#diagram .edge polygon { fill: var(--edge); }
+#diagram .edge text { fill: var(--ink-2); font-size: 12px; paint-order: stroke; stroke: var(--page); stroke-width: 4px; stroke-linejoin: round; }
+#diagram.has-sel .edge { opacity: 0.25; }
+#diagram.has-sel .edge.on { opacity: 1; }
+#diagram .edge.on path { stroke: var(--accent); stroke-width: 2.4; }
+#diagram .edge.on polygon { fill: var(--accent); }
+#diagram .edge.on text { fill: var(--ink); font-weight: 600; }
+#diagram .loop { fill: none; stroke: var(--loop); stroke-width: 2; stroke-dasharray: 8 6; }
+#diagram .loop-label { fill: var(--loop); font-size: 12px; font-weight: 650; }
+.panel { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow-y: auto; }
+.panel .kind { display: inline-block; font-size: 11.5px; font-weight: 600; border-radius: 999px;
+  padding: 2px 10px; margin: 0 6px 8px 0; background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--border); }
+.panel .kind.steps { background: var(--accent-soft); color: var(--ink); border-color: transparent; }
+.panel h2 { font-size: 19px; margin-bottom: 6px; word-break: break-word; }
+.panel .lead { font-size: 15px; color: var(--ink); }
+.panel ul { margin: 0; padding-left: 18px; }
+.panel li { margin: 3px 0; }
+.panel table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.panel td { border-top: 1px solid var(--grid); padding: 5px 6px 5px 0; vertical-align: top; }
+.panel td:first-child { white-space: nowrap; }
+.panel td.val { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.links { display: flex; flex-wrap: wrap; gap: 6px; }
+.links button { font: inherit; font-size: 12.5px; color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; cursor: pointer; }
+.links button:hover { border-color: var(--accent); }
+.hint { color: var(--muted); font-size: 12.5px; }
+section.card { margin-top: 16px; }
+table.steps { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.steps th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px;
+  border-bottom: 1px solid var(--grid); padding: 6px 8px; }
+table.steps td { border-bottom: 1px solid var(--grid); padding: 7px 8px; vertical-align: top; }
+table.steps td.num { font-variant-numeric: tabular-nums; color: var(--ink-2); white-space: nowrap; }
+table.steps tr.removed td { color: var(--muted); }
+table.steps tr[data-file] { cursor: pointer; }
+table.steps tr[data-file]:hover { background: var(--accent-soft); }
+table.steps tr.hl { background: var(--accent-soft); }
+.tablewrap { overflow-x: auto; }
+.filebtn { font: inherit; font-size: 12.5px; border: none; background: none; color: var(--accent);
+  cursor: pointer; padding: 0; text-decoration: underline; text-underline-offset: 2px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tactile map finger-tracking pipeline</h1>
+  <p class="sub">How the codebase turns a session video and a floorplan PNG into room-by-room timing data. The diagram reads top to bottom in the order the pipeline runs. <b>Click any box</b> to see what that file does, its inputs and outputs, its key functions and settings, and what it talks to. Arrows into a box are its inputs; arrows out are its outputs.</p>
+
+  <section class="facts" aria-label="Key facts">
+    <div class="card fact"><div class="label">Code files</div><div class="value">12</div><div class="note">11 pipeline modules + 1 optional tool</div></div>
+    <div class="card fact"><div class="label">Pipeline steps</div><div class="value">26</div><div class="note">steps 5 and 11 removed in the refactor</div></div>
+    <div class="card fact"><div class="label">Files saved per run</div><div class="value">7</div><div class="note">all in data/&lt;date_time&gt;__&lt;map&gt;__&lt;video&gt;/</div></div>
+    <div class="card fact"><div class="label">Map found (S-19)</div><div class="value">21.0 s</div><div class="note">sheet is face-down before that; score 0.92</div></div>
+    <div class="card fact"><div class="label">Crop confirmed</div><div class="value">99.4%</div><div class="note">of frames while the map is on the table (21–106 s)</div></div>
+    <div class="card fact"><div class="label">Crop cost</div><div class="value">~80 ms</div><div class="note">per frame, typical; MediaPipe is extra</div></div>
+  </section>
+
+  <div class="layout">
+    <div class="card">
+      <div class="legend" aria-label="Legend">
+        <span><i class="sw"></i>Python file</span>
+        <span><i class="sw tool"></i>optional tool</span>
+        <span><i class="sw in"></i>input you provide</span>
+        <span><i class="sw out"></i>file the run saves</span>
+        <span><i class="ln"></i>data passed</span>
+        <span><i class="ln call"></i>calls into</span>
+        <span><i class="ln loop"></i>repeats every frame</span>
+      </div>
+      <figure style="margin:0">
+        <div class="diagram-wrap">
+          <svg id="diagram" viewBox="0 0 1210 1170" role="img"
+               aria-label="Layered architecture: inputs feed run_pipeline.py, which builds the reference map once (paper_locator with edge_tracing and room_tracking), then every frame runs auto_crop (with paper_locator, corner_fitting, crop_checker, edge_tracing, manual_crop), finger_tracking and timing, and finally dashboard.py writes the results into the run folder."></svg>
+        </div>
+        <figcaption class="hint" style="margin-top:8px">Layers 4–6 (inside the orange dashed frame) run once for every video frame. Each green chip is a file the run saves into its <code>data/</code> folder, drawn next to the code that produces it.</figcaption>
+      </figure>
+    </div>
+    <aside class="card panel" id="panel" aria-live="polite"></aside>
+  </div>
+
+  <section class="card" aria-labelledby="steps-h">
+    <h2 id="steps-h">Every pipeline step, in order</h2>
+    <p class="hint">Click a row to open the file that does it.</p>
+    <div class="tablewrap">
+      <table class="steps">
+        <thead><tr><th>Step</th><th>When</th><th>What happens</th><th>File</th></tr></thead>
+        <tbody id="stepRows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="out-h">
+    <h2 id="out-h">What a run saves</h2>
+    <div class="tablewrap">
+      <table class="steps">
+        <thead><tr><th>File</th><th>Written by</th><th>Contents</th></tr></thead>
+        <tbody id="outRows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  // ------------------------------------------------------------------ content
+  const FILES = {
+    run_pipeline: {
+      title: "run_pipeline.py", kind: "Entry point", steps: "Runs every step",
+      lead: "The file you run. It creates the run folder, builds the reference map once, then loops over every video frame calling the crop, finger and timing stages in order, draws the live window, and saves every output when the video ends.",
+      body: [
+        "Start of a run: makes data/<YYYY-MM-DD_HH-MM-SS>__<map name>__<video name>/, finds the newest earlier run of the same floorplan so hand-edited room names carry over, builds the ReferenceMap (which writes map.json) and saves rooms.png.",
+        "Every frame: reads the next frame, calls AutoCrop.update (layer 4), FingerTracker.update (layer 5) and Timing.step (layer 6). In display mode it draws the crop (green outline, labeled corners, the PNG's printed lines in cyan where the crop places them), a status bar, and the optional overlays.",
+        "Keys: c shows / hides the on-screen list of commands; Space stops the video and opens manual_crop.py; t shows trails and room outlines (l / r then toggle the left / right trail); e shows the paper-edge debug view; w shows edge tracing (inside the crop only); [ and ] change playback speed (display only, every frame is still processed); q saves and quits.",
+        "End of run (video ends or q): writes finger_paths.png, session.json, frame_lines.json, then calls dashboard.py for dashboard.json and dashboard.html, and opens the dashboard.",
+      ],
+      inputs: ["Video path (any OpenCV-readable video)", "Map PNG path", "--data-dir (default: data/ next to the code)", "--no-display (batch mode, no window)", "--no-open (don't open the dashboard)"],
+      outputs: ["The run folder and all 7 files in it (some written through the modules below)", "Live 'Video Tracker' window (display mode)", "Console progress"],
+      funcs: [
+        ["run(video, map, data_dir, display, open_dashboard)", "The whole run, start to finish. Returns the run folder."],
+        ["make_run_dir(map, video)", "Creates the date/time + map + video named folder."],
+        ["previous_map_json(map)", "Newest earlier run's map.json for the same floorplan (for name carry-over)."],
+        ["draw_crop / draw_regions / banner", "Live-window drawing: crop, rooms and symbols, messages."],
+      ],
+      settings: [["DEFAULT_PLAYBACK_SPEED", "1.5×", "Display speed only"], ["DATA_DIR", "data/", "Where run folders go"]],
+      calls: ["paper_locator", "auto_crop", "finger_tracking", "timing", "dashboard", "manual_crop", "edge_tracing"],
+      calledBy: [],
+      notes: ["Windows Controlled Folder Access must allow python.exe, or creating the run folder fails with a misleading 'No such file or directory'."],
+    },
+    paper_locator: {
+      title: "paper_locator.py", kind: "Auto-crop, part 1", steps: "Steps 1–8",
+      lead: "Knows the map and finds the paper. Builds the reference map and its JSON once (step 1), and provides the building blocks auto_crop uses every frame: the paper mask, starting outlines, the orientation scoring rubric, the search window, blob isolation, and sorting paper edges by side.",
+      body: [
+        "Step 1 — ReferenceMap: loads the PNG (transparent areas put on white), traces it with edge_tracing, detects rooms and symbols with room_tracking, and writes map.json: every wall line as a graph (nodes = line ends, corners, T-junctions; edges = the lines between), the printed border, room outlines and symbols. It also precomputes lookup tables for scoring and refinement (distance from every map pixel to the nearest printed wall/symbol/dot, and which printed pixel that is). The PNG is used in its own orientation; the old fixed 180° rotation is gone.",
+        "Step 2 — paper_mask: Otsu splits bright from dark per frame; bright pixels that are too colorful (skin) are dropped, with the saturation cutoff only ever tightening below 55. ink_border_mask is Vivaan's fallback: everything darker than gray 180 (ink and desk), so the paper reads as the bright region inside it.",
+        "Step 3 — starting outlines (first lock and recovery only): paper_blob_quads (each paper blob ≥ 3% of the frame) and traced_map_quads (clusters of traced walls; the cluster's 4-corner outline is the printed border, converted to page corners using where the border sits on the PNG). The second needs no paper edge at all.",
+        "Step 4 — orientation + rubric: an outline already has the paper's true angle; orientations() gives the 4 ways to say which corner is the map's top-left. alignment_score warps the frame's traced ink into PNG space and compares walls to walls, symbols to symbols, dots to dots (precision = traced pixels landing on printed ones; recall = printed pixels that were traced; F-beta 0.5 favors precision so hands covering the map cost less). Score = 0.4·walls + 0.4·symbols + 0.2·dots. Measured: right orientation 0.98–0.99, flipped 180° ~0.40, 90/270° 0.10–0.14, decoy sheet 0.04, blank page < 0.07.",
+        "Steps 6–8 — search_window grows last frame's crop by 35%; candidate_blobs finds up to 3 separate paper blobs in it (paper mask computed on the window only); classify_segments assigns each straight paper edge to top/right/bottom/left by angle (within 20°) and distance to that side's line.",
+      ],
+      inputs: ["Map PNG (step 1)", "Video frame + last frame's crop (steps 2–8)", "Traced frame ink from edge_tracing (steps 3–4)"],
+      outputs: ["ReferenceMap object (PNG, trace, rooms, scoring tables)", "map.json", "Paper masks, candidate outlines, scores, side-sorted segments"],
+      funcs: [
+        ["ReferenceMap(path, json_path, names_from)", "Step 1; writes map.json, keeps hand-edited names."],
+        ["paper_mask / ink_border_mask", "Step 2 and its fallback."],
+        ["paper_blob_quads / traced_map_quads", "Step 3 starting outlines."],
+        ["orientations / alignment_score", "Step 4 rubric."],
+        ["search_window / candidate_blobs / classify_segments", "Steps 6–8."],
+        ["draw_paper_debug", "The 'e' overlay."],
+      ],
+      settings: [["PAPER_SAT_MAX", "55", "Max saturation for paper (skin rejection)"], ["INK_BORDER_THRESHOLD", "180", "Gray level for the ink-border fallback"], ["MIN_BLOB_FRACTION", "3%", "Of the frame, to be a sheet"], ["SCORE_TOLERANCE", "5 px", "Map px for a traced line to 'match'"], ["CLASS_WEIGHTS", "0.4 / 0.4 / 0.2", "Walls / symbols / dots"], ["SEARCH_MARGIN", "35%", "Tested 20%: 3× more unconfirmed frames and slower"], ["MAX_CANDIDATES", "3", "Blobs per frame"], ["SIDE_ANGLE_TOLERANCE", "20°", "Segment vs side angle"]],
+      calls: ["edge_tracing", "room_tracking"], calledBy: ["run_pipeline", "auto_crop", "corner_fitting", "crop_checker"],
+      notes: ["The search margin is not about motion (99.9% of frames move < 2.4% of the paper's diagonal); the paper/desk split is computed inside the window and more desk keeps it stable."],
+    },
+    edge_tracing: {
+      title: "edge_tracing.py", kind: "Line tracing", steps: "Used by steps 1, 3, 4, 13",
+      lead: "Finds the printed black lines in an image — the reference PNG, or a video frame — optionally only inside a region the caller gives it. Self-contained: it doesn't import the crop code.",
+      body: [
+        "ink_mask: a morphological black-hat filter keeps dark strokes thinner than ~9 px and ignores large dark areas, so the desk and shadows don't count as ink. With region=…, only that polygon's pixels are processed at all.",
+        "On video frames, once the map is locked, the region is last frame's crop grown by 35% (the paper moves a little between frames); the 'w' view and frame_lines.json use the exact crop. Before the map is found (or while lost) there is no crop, so the whole frame is traced — that's how the paper is found.",
+        "ink_classes splits the ink into dots (≤ 12 px), walls (≥ 80 px long) and symbols (in between). trace_segments finds straight wall lines (Hough) and merges duplicates; build_line_graph turns them into nodes (line ends, corners, T-junctions) and edges with length and angle.",
+        "load_image composites transparent PNGs onto white (read naively, they come out black). Run on its own (python edge_tracing.py image-or-video) it writes <name>.lines.json and .lines.png and lists every symbol's center, size and shape.",
+      ],
+      inputs: ["Grayscale image (PNG or video frame)", "Optional region polygon (the crop)"],
+      outputs: ["Ink mask", "Per-pixel classes (dot/symbol/wall)", "Merged wall segments", "Line graph JSON (nodes + edges)", "Symbol boxes with shape labels"],
+      funcs: [
+        ["ink_mask(gray, region=None)", "Thin dark strokes, optionally inside a region only."],
+        ["ink_classes(mask)", "Dots / symbols / walls by mark size."],
+        ["trace_segments / merge_segments", "One segment per printed line."],
+        ["build_line_graph(segments)", "Nodes + edges for the JSON."],
+        ["Trace(gray, region=…)", "All of the above at once; symbol_marks(), to_json()."],
+        ["load_image / classify_shape / draw_trace", "Loading, shape labels, the 'w' overlay."],
+      ],
+      settings: [["BLACKHAT_KERNEL", "9 px", "Strokes thinner than this are ink"], ["INK_THRESHOLD", "30", "Black-hat response needed"], ["DOT_MAX_EXTENT", "12 px", "Dots"], ["WALL_MIN_EXTENT", "80 px", "Walls (40 px on video frames)"]],
+      calls: [], calledBy: ["paper_locator", "auto_crop", "corner_fitting", "run_pipeline", "room_tracking", "dashboard"],
+      notes: ["On S-19, restricting tracing to the crop removes ~5,000 stray ink pixels per frame (the decoy sheet, hand outlines, desk) with no loss of crop accuracy."],
+    },
+    room_tracking: {
+      title: "room_tracking.py", kind: "Rooms", steps: "Step 1 (rooms) · used in step 25",
+      lead: "Works out exactly which pixels of the PNG belong to which room, and which room each symbol sits in. Rooms aren't labeled anywhere — they're the white spaces enclosed by walls.",
+      body: [
+        "Problem: every room has doorway gaps, so flood-filling leaks between rooms. Solution: thicken the walls just enough to seal the doorways, take each sealed white area (not touching the image edge, not tiny) as a room seed, then grow every seed back out to the real walls so each non-wall pixel inside the map belongs to the nearest room. Doorway pixels are split between the two rooms either side.",
+        "The doorway-sealing width is picked automatically: 16 widths from 1.5% to 9% of the map's size are tried and the smallest one giving the most common (stable) room count wins. On map E: 11 rooms (10 rooms + the corridor).",
+        "Rooms are named Room 1… in reading order; each gets an outline polygon, area, centroid and bounding box (saved in map.json). Symbols come from edge tracing's symbol marks, padded by 6 px and tagged with their room.",
+        "RoomMap rebuilds a per-pixel room label image from the saved polygons, so room_at(x, y) is a single array lookup — and always matches exactly what's in map.json. RoomMap.draw renders rooms.png.",
+      ],
+      inputs: ["Wall mask from edge_tracing (PNG)", "Symbol marks from edge_tracing"],
+      outputs: ["Room polygons + label image", "Symbol list with rooms", "rooms.png (via RoomMap.draw)"],
+      funcs: [["detect_rooms(walls)", "Rooms from the wall mask."], ["choose_gap(walls)", "Automatic doorway width."], ["detect_symbols(trace, labels)", "Symbols tagged with rooms."], ["RoomMap.room_at / symbols_at / draw", "Lookups used by the timers; picture for rooms.png."]],
+      settings: [["MIN_ROOM_AREA_FRACTION", "0.2%", "Of the map; smaller sealed areas are noise"], ["SYMBOL_PADDING", "6 px", "Added around symbol boxes"]],
+      calls: ["edge_tracing"], calledBy: ["paper_locator", "timing"],
+      notes: ["Rename rooms by editing a run's map.json; the next run of the same floorplan keeps the names."],
+    },
+    auto_crop: {
+      title: "auto_crop.py", kind: "Crop running order", steps: "Steps 2–21 each frame",
+      lead: "The running order of the crop pipeline. It holds no image-processing of its own; each frame it calls edge_tracing, paper_locator, corner_fitting and crop_checker in order, decides which candidate crop wins, and tracks whether the crop is confirmed, unconfirmed or lost.",
+      body: [
+        "Before the map is found: traces the whole frame and runs the full search (steps 2–4) every 10 frames until a crop scores ≥ 0.60 and passes the outline check. The S-19 video starts with the sheet face-down, so this correctly waits until 21 s.",
+        "Each frame after that: (1) edge-trace inside last frame's crop + 35%; (2) candidate A — last frame's crop re-fitted to the traced lines (step 13); (3) if A scores < 0.60, candidates B — each paper blob's fitted corners (steps 6–12, with the ink-border fallback), snapped (15) and refined (13); (4) every candidate must pass the sanity checks and the paper-outline check (14); (5) best score ≥ 0.40 wins (17), with the stationary check (16) and smoothing.",
+        "If nothing passes: every 3 frames a shift search slides the crop to the best few alignments (FFT cross-correlation) and refines each — this is what fixes a crop that slipped by one room. Then Backup #1 (SIFT vs PNG) and Backup #2 (optical flow). After 20 frames without confirmation the crop is lost and the whole-frame search runs every 3 frames (near-ties within 85% go to the one nearest the last crop).",
+        "Finally the rigid-paper correction and per-corner visibility (step 21). On the first lock it also records frame_lines.json: the frame's traced line graph, in frame and PNG pixels, with the score breakdown.",
+      ],
+      inputs: ["Video frame (BGR)", "ReferenceMap", "Corners placed by hand (from manual_crop, on Space)"],
+      outputs: ["4 crop corners (map TL, TR, BR, BL in frame pixels) or None", "source (found/lines/edges/realigned/PNG/flow/held/lost/recovered/manual) + score", "frame_lines.json (first lock)"],
+      funcs: [["AutoCrop.update(frame, i)", "One frame of the crop pipeline."], ["AutoCrop.locate(frame)", "Whole-frame search (first lock / recovery)."], ["AutoCrop.judge(quad)", "Outline check + rubric score."], ["AutoCrop._realign(prior)", "Shift search when the crop slipped."], ["AutoCrop.reset(frame, corners)", "Accept corners from manual_crop."]],
+      settings: [["LOCK_SCORE", "0.60", "First lock / recovery"], ["TRACK_SCORE", "0.40", "Per-frame acceptance"], ["STRONG_SCORE", "0.60", "Skip paper-edge candidates above this"], ["SEARCH_EVERY", "10 frames", "Search rate before first lock"], ["MAX_UNCONFIRMED", "20 frames", "Then 'lost'"], ["RECOVERY_EVERY / REALIGN_EVERY", "3 frames", "Search rates when lost / slipped"], ["NEAR_TIE", "85%", "Recovery tie-break"]],
+      calls: ["edge_tracing", "paper_locator", "corner_fitting", "crop_checker"], calledBy: ["run_pipeline"],
+      notes: ["On S-19 the crop is confirmed on all but 15 frames (0.5 s) while the map is on the table, and visually checked frame-by-frame through two-handed slides."],
+    },
+    corner_fitting: {
+      title: "corner_fitting.py", kind: "Auto-crop, part 2", steps: "Steps 9–17",
+      lead: "Turns edges into exact corners, and uses edge tracing to fine-tune the crop.",
+      body: [
+        "Step 9 — weighted_points: points every 4 px along each edge segment, so long clean edges count for more; loosely angled segments get fewer points (down to 15%).",
+        "Step 10 — fit_side_line: robust line fit (Huber), drop clear outliers (beyond median + 4×MAD), refit. Step 12 — fit_quad: Canny + Hough on the blob mask, sort segments by side (step 8), fit each side, intersect neighbors → 4 corners even if a corner is hidden. (Step 11, reusing an old side line, was removed: it kept stale lines alive.)",
+        "Step 13 — refine_with_traced_lines (ICP): pushes the frame's traced walls and symbols through the crop into PNG space, pairs each with the nearest printed pixel, re-fits the homography with RANSAC; the pairing radius shrinks 14 → 10 → 7 → 5 → 4 px. Corridor dots are excluded on both sides because their regular spacing let a shifted crop still 'fit'. shift_candidates (FFT cross-correlation over ±35%) gives starting points when the crop has slipped.",
+        "Step 15 — snap_corners (cornerSubPix, ignored if it moves > 8 px). Step 16 — keep_if_stationary (≥ 2 corners within 2 px → keep last frame's crop, no jitter). Step 17 — pick_best and smooth (65% new / 35% old).",
+      ],
+      inputs: ["Blob or ink-border masks + last frame's crop", "Frame ink from edge_tracing", "ReferenceMap lookup tables"],
+      outputs: ["Fitted corners + which corners were visible", "Refined frame → map homography", "Shift-search starting points", "Smoothed final corners"],
+      funcs: [["weighted_points / fit_side_line / intersect", "Steps 9, 10, 12."], ["fit_quad(mask, x0, y0, prior)", "Step 12."], ["refine_with_traced_lines(ref, ink, H, quad)", "Step 13 (ICP)."], ["shift_candidates(ref, ink, H)", "Step 13, wider: realignment starts."], ["snap_corners / keep_if_stationary / pick_best / smooth", "Steps 15–17."]],
+      settings: [["MIN_SEGMENT_LENGTH", "25 px", "Shorter Hough segments ignored"], ["POINT_SPACING", "4 px", "Step 9"], ["ICP_TOLERANCES", "14,10,7,5,4", "Map px per round"], ["ICP_MAX_POINTS", "2500", "Traced pixels used"], ["FRAME_DOT_MAX", "9 px", "Dots left out of ICP"], ["SHIFT_SEARCH_MAX / PEAKS", "35% / 5", "Realignment"], ["SNAP_MAX_SHIFT", "8 px", "Step 15"], ["SMOOTHING", "0.65", "Share of the new crop"]],
+      calls: ["paper_locator", "edge_tracing"], calledBy: ["auto_crop"],
+      notes: [],
+    },
+    crop_checker: {
+      title: "crop_checker.py", kind: "Checks + backups", steps: "Steps 14, 18, 19, 21",
+      lead: "Decides whether a crop is believable, and what to do when no crop is.",
+      body: [
+        "Step 14 — check_quad: corners within 25° of square, width/height within 35% of the PNG's, at least 3% of the frame, no corner more than 20 px off the frame, and (while the lock is trusted) no corner jumping more than 8% of the frame diagonal.",
+        "outline_agreement: samples 40 points per crop edge and checks the image is clearly brighter just inside (paper or hand) than just outside (desk). A crop needs ≥ 0.65. This catches what the line score can't: on evenly sized rooms, a crop shifted by exactly one room still lines walls up with other walls and scores 0.5–0.6. Measured: correct crops 0.81–0.82, crops stuck one room off 0.47–0.57.",
+        "Step 18 — PngBackup: SIFT-match the PNG against the frame near the last crop, solve the homography (MAGSAC); needs ≥ 14 inliers, ≤ 3 px error, inliers spread over ≥ 3.5% of the map, area within 0.65–1.55× last frame's (when trusted), and an alignment score ≥ 0.35 with the outline check.",
+        "Step 19 — FlowBackup: optical flow on up to 700 paper points, forward-backward checked; the points are only picked from the remembered previous frame when the backup actually runs (picking them every frame was 30% of all per-frame time). Step 21 — correct_outlier_corner (paper is rigid: 3 still corners + 1 jumping corner → fix the jumper) and corner_visible (green/orange corner dots).",
+      ],
+      inputs: ["Candidate crop + last frame's crop", "Grayscale frame", "A score function from auto_crop"],
+      outputs: ["Pass/fail + reason", "Outline agreement 0–1", "Backup crops (or none)", "Corrected corners, visible flags"],
+      funcs: [["check_quad(quad, shape, aspect, prior, max_jump)", "Step 14."], ["outline_agreement(gray, quad)", "Edges must sit on the paper's edges."], ["PngBackup.locate", "Step 18."], ["FlowBackup.remember / locate", "Step 19."], ["correct_outlier_corner / corner_visible", "Step 21."]],
+      settings: [["CORNER_ANGLE_TOLERANCE", "25°", ""], ["ASPECT_TOLERANCE", "35%", ""], ["MAX_JUMP", "8% diag", "Per frame, trusted"], ["OUTLINE_MIN", "0.65", ""], ["MIN_MATCHES", "14", "SIFT inliers"], ["MAX_REPROJECTION_ERROR", "3 px", ""], ["MIN/MAX_AREA_RATIO", "0.65–1.55", "SIFT backup"], ["BACKUP_MIN_SCORE", "0.35", "Both backups"]],
+      calls: ["paper_locator"], calledBy: ["auto_crop"],
+      notes: [],
+    },
+    manual_crop: {
+      title: "manual_crop.py", kind: "Manual tool", steps: "Outside the pipeline",
+      lead: "Stop the video and drag the crop's corners by hand. Not a pipeline step — it only runs when you press Space.",
+      body: [
+        "The video freezes, the PNG is blended over the current crop, and the corners are labeled TL/TR/BR/BL (TL = the map's top-left). Click or drag anywhere and the nearest corner follows.",
+        "Space or Enter accepts and tracking continues from your corners (AutoCrop.reset); Esc cancels; q quits. If the map hasn't been found yet, it starts with default corners in the middle of the frame.",
+        "Also holds VideoWindow, the resizable window the video plays in: it letterboxes the frame to any window size and maps clicks back to the right frame pixel.",
+      ],
+      inputs: ["The current frame", "Current crop corners (or none)", "PNG image for the overlay", "Mouse + keys"],
+      outputs: ["Corners you placed (to auto_crop)", "'accept' / 'cancel' / 'quit'"],
+      funcs: [["adjust_corners(window, frame, corners, png)", "The drag-the-corners screen."], ["VideoWindow.show / to_frame", "Letterboxed window and click mapping."], ["overlay_map(frame, corners, png)", "PNG blended onto the crop."]],
+      settings: [],
+      calls: [], calledBy: ["run_pipeline"],
+      notes: ["Untested on a real screen by the assistant; checked with a screenshot harness that simulates keys."],
+    },
+    finger_tracking: {
+      title: "finger_tracking.py", kind: "Fingers", steps: "Steps 22–24",
+      lead: "Finds the index fingertip of up to two hands, maps it onto the PNG, and keeps Left and Right from swapping.",
+      body: [
+        "Step 22 — crop around the paper (22% / 30% margins), enlarge up to 2.5× (capped near 1280 px), run MediaPipe HandLandmarker (2 hands, low confidence thresholds) and take landmark 8, the index fingertip.",
+        "Step 23 — crop pixels → frame pixels → PNG pixels, through a homography built fresh each frame from that frame's 4 corners (nothing carries over, so nothing drifts). Each tip is flagged on_paper if it lands on the map; tips more than 50% outside are ignored.",
+        "Step 24 — identity: each hand is matched to whichever hand's wrist was closest last frame (both hands solved together), then labeled from a short, fading, confidence-weighted memory of MediaPipe's own Left/Right calls, so a wrong label can't stick. Two visible hands always get different labels.",
+        "Keeps the trails (broken instead of drawn straight across jumps > 140 px or gaps) and the per-frame session log: frame, time, crop source + score, corners, and each hand's frame/map position, on_paper flag and raw MediaPipe label.",
+      ],
+      inputs: ["Video frame", "4 crop corners from auto_crop", "hand_landmarker.task"],
+      outputs: ["This frame's fingertips (hand, frame x/y, map x/y, on_paper)", "Trails → finger_paths.png", "Session log → session.json"],
+      funcs: [["FingerTracker.update(frame, corners, i, t, source, score)", "Steps 22–24 for one frame."], ["hand_crop", "Step 22 crop."], ["match_hands / label_hands / HandTrack", "Step 24."], ["draw_trails", "On the map or warped onto the video."]],
+      settings: [["MAX_FINGER_JUMP", "140 px", "Bigger jump = not the same hand"], ["PATH_BREAK_JUMP", "140 px", "Trail breaks here"], ["PATH_MARGIN", "5%", "Off-map slack for trails"], ["TRACK_MARGIN", "50%", "Ignore tips further out"], ["FINGER_SMOOTHING", "0.35", "Identity-tracking point"]],
+      calls: [], calledBy: ["run_pipeline"],
+      notes: ["For this participant pale skin can pass the paper filter, so the crop leans on the printed lines when hands cover the page."],
+    },
+    timing: {
+      title: "timing.py", kind: "Timers", steps: "Step 25",
+      lead: "One enter/exit timer per region: the paper itself, every room, every symbol, and any hand-drawn box.",
+      body: [
+        "Timers: 'On paper' (any fingertip on the map's pixels), one per room (exact room pixels via RoomMap.room_at), one per symbol (hover), one per extra box from label_symbols.py.",
+        "A visit starts the first frame any fingertip is inside and ends once none has been inside for 0.4 s (MediaPipe drops hands for a few frames; a lifted hand ends it too); the end time is the last moment a finger was actually in. Two hands inside at once = one visit.",
+        "Only visits of ≥ 1 s count; shorter ones are 'brushes'. Each region ends as visited, brushed only, or missed, with visit count, total and longest time, first entry, and every enter/exit event. sequence() is every visit in order — the path through the rooms.",
+      ],
+      inputs: ["This frame's fingertips (from finger_tracking)", "RoomMap (rooms + symbols)", "<map>.symbols.json (optional, from label_symbols.py)"],
+      outputs: ["Per-region summaries + events", "Visit order", "Which regions are occupied right now (live overlay)"],
+      funcs: [["Timing.step(tips, t)", "Every frame."], ["RegionTimer", "One region's enter/exit logic."], ["Timing.summaries / sequence", "For the dashboard."], ["load_manual_boxes", "Optional boxes; converts old 180°-rotated files."]],
+      settings: [["MIN_VISIT_MS", "1000 ms", "Shorter = brush"], ["EXIT_GRACE_MS", "400 ms", "Out this long = exit"]],
+      calls: [], calledBy: ["run_pipeline"],
+      notes: [],
+    },
+    dashboard: {
+      title: "dashboard.py", kind: "Results", steps: "Step 26",
+      lead: "Saves the session's results as JSON and builds the self-contained HTML dashboard (map and data embedded, works offline).",
+      body: [
+        "save_dashboard_data closes any open visits and writes dashboard.json: session info, the paper timer, every room and symbol (status, visits, totals, longest, first entry, events, outline), the visit order, per-frame crop source, and both hands' timestamped paths (broken at jumps). It prints a per-box summary to the console.",
+        "build_dashboard writes dashboard.html: summary tiles, the map with rooms and symbols colored visited / brushed / missed and both hands' paths with a time slider and Play, a table of every room and symbol, an enter/exit timeline (with rows for crop reliability and time on paper), and the visit order. Light and dark mode.",
+        "Rebuild later: python dashboard.py \"data/<run folder>/dashboard.json\" — it finds the map PNG by itself.",
+      ],
+      inputs: ["Timing (summaries, sequence)", "FingerTracker (session log)", "ReferenceMap", "Video path, fps, duration"],
+      outputs: ["dashboard.json", "dashboard.html"],
+      funcs: [["save_dashboard_data(...)", "Results JSON."], ["build_dashboard(data, map, out)", "HTML dashboard."], ["main()", "Rebuild from a saved JSON."]],
+      settings: [],
+      calls: ["edge_tracing", "finger_tracking"], calledBy: ["run_pipeline"],
+      notes: [],
+    },
+    label_symbols: {
+      title: "label_symbols.py", kind: "Optional tool", steps: "Before a run",
+      lead: "Draw extra boxes by hand on the PNG. Rooms and symbols are found automatically now, so this is only for regions the automatic detection doesn't cover.",
+      body: [
+        "Press s (symbol) or r (room), click two opposite corners, type a name in the window and press Enter (or Enter/Esc to keep the auto number). u undoes, d saves.",
+        "Saves <map>.symbols.json next to the PNG, in the PNG's own orientation (\"space\": \"png\"); older files drawn on the 180°-rotated map are converted when loaded. Each box gets its own timer.",
+      ],
+      inputs: ["Map PNG", "Mouse + keys"], outputs: ["<map>.symbols.json"],
+      funcs: [], settings: [], calls: [], calledBy: [], notes: ["Run with: python label_symbols.py distractor_floorplan_E.png"],
+    },
+    png: { title: "distractor_floorplan_E.png", kind: "Input", steps: "Read in step 1", lead: "The floorplan map. Any PNG works (transparent and grayscale ones too). Its own pixel coordinates are the coordinate system for everything: rooms, symbols, fingertips, paths.", body: ["Edge tracing reads its walls, symbols and dots; room tracking finds its rooms; the scoring rubric and refinement compare video frames against it; the dashboard shows it."], inputs: [], outputs: ["Read by run_pipeline → paper_locator.ReferenceMap"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    mp4: { title: "S-19_Elevator.mp4", kind: "Input", steps: "Read every frame", lead: "The session video. 1920×1080, 29.97 fps, 1:52.6 long; the map is face-up from 21 s to 106 s, next to a decoy sheet.", body: ["Any video OpenCV can read works. Every frame is processed, whatever the display speed."], inputs: [], outputs: ["Frames → run_pipeline"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    task: { title: "hand_landmarker.task", kind: "Input", steps: "Used in step 22", lead: "MediaPipe's hand landmark model file. Must sit in the project folder.", body: ["Loaded once by finger_tracking.create_hand_landmarker in VIDEO mode for up to 2 hands."], inputs: [], outputs: ["Hand landmarks → finger_tracking"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    symbols_json: { title: "<map>.symbols.json", kind: "Optional input", steps: "Read in step 25", lead: "Extra hand-drawn boxes from label_symbols.py, next to the PNG. Each becomes a timer.", body: [], inputs: ["Written by label_symbols.py"], outputs: ["Read by timing.load_manual_boxes"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    map_json: { title: "map.json", kind: "Saved file", steps: "Step 1", lead: "The PNG's lines as a graph (nodes: line ends, corners, T-junctions; edges: lines with length and angle), the printed border, the doorway width used, every room (id, name, area, centroid, bbox, outline polygon) and every symbol (id, name, shape, room, bbox).", body: ["Rename a room or symbol here and the next run of the same floorplan keeps the name."], inputs: ["paper_locator.ReferenceMap"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    rooms_png: { title: "rooms.png", kind: "Saved file", steps: "Step 1", lead: "Picture of the detected rooms (tinted, named) and symbols (boxed) on the PNG, to check the automatic detection.", body: [], inputs: ["room_tracking.RoomMap.draw"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    frame_lines: { title: "frame_lines.json", kind: "Saved file", steps: "First lock", lead: "Edge tracing's line graph of the video frame where the map was first found (traced inside the crop), each node in frame pixels and in PNG pixels, plus the crop and its full score breakdown. Directly comparable with map.json.", body: [], inputs: ["auto_crop (first lock)"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    finger_paths: { title: "finger_paths.png", kind: "Saved file", steps: "End of run", lead: "Left trail (red) and right trail (blue) drawn on the PNG.", body: [], inputs: ["finger_tracking.draw_trails (written by run_pipeline)"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    session_json: { title: "session.json", kind: "Saved file", steps: "Every frame", lead: "One record per frame: frame number, time, how the crop was found and its score, the 4 corners, and each hand's frame/map position, on_paper flag and raw MediaPipe label.", body: [], inputs: ["finger_tracking session log (written by run_pipeline)"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    dash_json: { title: "dashboard.json", kind: "Saved file", steps: "Step 26", lead: "All the results: session info, paper timer, every room and symbol with status/visits/times/events, the visit order, per-frame crop source and both hands' paths.", body: [], inputs: ["dashboard.save_dashboard_data"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    dash_html: { title: "dashboard.html", kind: "Saved file", steps: "Step 26", lead: "The interactive results dashboard: one file, works offline, opens automatically at the end of a run.", body: [], inputs: ["dashboard.build_dashboard"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    data_folder: { title: "data/<date_time>__<map>__<video>/", kind: "Run folder", steps: "Every run", lead: "Every run gets its own folder, e.g. data/2026-10-08_09-21-39__distractor_floorplan_E__S-19_Elevator/, holding all 7 files: map.json, rooms.png, frame_lines.json, finger_paths.png, session.json, dashboard.json, dashboard.html.", body: ["Use --data-dir to put run folders somewhere else."], inputs: ["run_pipeline.make_run_dir"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+  };
+
+  // ------------------------------------------------------------------ layout
+  const BANDS = [
+    [20, 145, "1 · Inputs", "files you provide"],
+    [150, 245, "2 · Start the run", "once"],
+    [250, 400, "3 · Know the map", "step 1 · once"],
+    [410, 665, "4 · Find & follow", "steps 2–21 · every frame"],
+    [670, 785, "5 · Fingers", "steps 22–24 · every frame"],
+    [790, 895, "6 · Timers", "step 25 · every frame"],
+    [905, 1025, "7 · Results", "step 26 · end of run"],
+    [1035, 1160, "8 · Run folder", "saved in data/"],
+  ];
+  const NODES = [
+    ["label_symbols", 200, 40, 220, 62, "label_symbols.py", "optional · draw extra boxes", "tool"],
+    ["symbols_json", 225, 110, 170, 24, "<map>.symbols.json", "", "input chip"],
+    ["png", 450, 40, 220, 62, "distractor_floorplan_E.png", "floorplan map", "input"],
+    ["mp4", 690, 40, 220, 62, "S-19_Elevator.mp4", "session video", "input"],
+    ["task", 930, 40, 220, 62, "hand_landmarker.task", "MediaPipe hand model", "input"],
+    ["run_pipeline", 450, 165, 460, 62, "run_pipeline.py", "entry point · run folder · frame loop · window", ""],
+    ["edge_tracing", 190, 275, 220, 64, "edge_tracing.py", "finds printed lines", ""],
+    ["paper_locator", 490, 275, 240, 64, "paper_locator.py", "auto-crop part 1 · steps 1–8", ""],
+    ["room_tracking", 810, 275, 200, 64, "room_tracking.py", "rooms + symbols", ""],
+    ["map_json", 520, 360, 130, 24, "map.json", "", "output chip"],
+    ["rooms_png", 845, 360, 130, 24, "rooms.png", "", "output chip"],
+    ["manual_crop", 190, 450, 210, 64, "manual_crop.py", "Space: drag corners", "tool"],
+    ["auto_crop", 490, 450, 240, 64, "auto_crop.py", "crop running order", ""],
+    ["frame_lines", 790, 470, 150, 24, "frame_lines.json", "", "output chip"],
+    ["corner_fitting", 190, 580, 230, 64, "corner_fitting.py", "auto-crop part 2 · steps 9–17", ""],
+    ["crop_checker", 760, 580, 230, 64, "crop_checker.py", "checks + backups · 14, 18–21", ""],
+    ["finger_tracking", 490, 690, 240, 64, "finger_tracking.py", "steps 22–24 · tips → map", ""],
+    ["finger_paths", 220, 694, 150, 24, "finger_paths.png", "", "output chip"],
+    ["session_json", 220, 728, 150, 24, "session.json", "", "output chip"],
+    ["timing", 490, 810, 240, 64, "timing.py", "step 25 · enter/exit timers", ""],
+    ["dashboard", 490, 940, 240, 64, "dashboard.py", "step 26 · results + HTML", ""],
+    ["dash_json", 790, 946, 150, 24, "dashboard.json", "", "output chip"],
+    ["dash_html", 790, 980, 150, 24, "dashboard.html", "", "output chip"],
+    ["data_folder", 190, 1062, 970, 80, "data/<date_time>__<map>__<video>/", "map.json · rooms.png · frame_lines.json · finger_paths.png · session.json · dashboard.json · dashboard.html", "output"],
+  ];
+  // [from, to, points, label, labelX, labelY, anchor, kind]
+  const EDGES = [
+    ["png", "run_pipeline", [[560, 102], [560, 165]], "map path", 566, 138, "start", "data"],
+    ["mp4", "run_pipeline", [[800, 102], [800, 165]], "video frames", 806, 138, "start", "data"],
+    ["label_symbols", "symbols_json", [[310, 102], [310, 110]], "", 0, 0, "", "data"],
+    ["run_pipeline", "paper_locator", [[610, 227], [610, 275]], "ReferenceMap(png)", 616, 256, "start", "call"],
+    ["paper_locator", "edge_tracing", [[490, 293], [410, 293]], "Trace(PNG)", 450, 286, "middle", "call"],
+    ["edge_tracing", "paper_locator", [[410, 322], [490, 322]], "lines + walls", 450, 335, "middle", "data"],
+    ["paper_locator", "room_tracking", [[730, 293], [810, 293]], "wall mask", 770, 286, "middle", "call"],
+    ["room_tracking", "paper_locator", [[810, 322], [730, 322]], "rooms", 770, 335, "middle", "data"],
+    ["paper_locator", "map_json", [[585, 339], [585, 360]], "", 0, 0, "", "data"],
+    ["room_tracking", "rooms_png", [[910, 339], [910, 360]], "", 0, 0, "", "data"],
+    ["auto_crop", "paper_locator", [[700, 450], [700, 339]], "steps 2–8 + score", 706, 432, "start", "call"],
+    ["auto_crop", "edge_tracing", [[520, 450], [520, 428], [300, 428], [300, 339]], "ink_mask(frame, crop + 35%)", 410, 422, "middle", "call"],
+    ["manual_crop", "auto_crop", [[400, 482], [490, 482]], "corners", 445, 476, "middle", "data"],
+    ["auto_crop", "frame_lines", [[730, 482], [790, 482]], "1st lock", 760, 476, "middle", "data"],
+    ["auto_crop", "corner_fitting", [[520, 514], [520, 556], [305, 556], [305, 580]], "steps 9–17 · ICP · shift search", 412, 550, "middle", "call"],
+    ["auto_crop", "crop_checker", [[700, 514], [700, 556], [875, 556], [875, 580]], "steps 14, 18–21", 788, 550, "middle", "call"],
+    ["auto_crop", "finger_tracking", [[610, 514], [610, 690]], "4 crop corners", 616, 672, "start", "data"],
+    ["task", "finger_tracking", [[1150, 71], [1195, 71], [1195, 706], [730, 706]], "hand model", 960, 700, "middle", "data"],
+    ["room_tracking", "timing", [[1010, 307], [1150, 307], [1150, 842], [730, 842]], "RoomMap: room pixels + symbol boxes", 940, 836, "middle", "data"],
+    ["finger_tracking", "finger_paths", [[490, 706], [370, 706]], "", 0, 0, "", "data"],
+    ["finger_tracking", "session_json", [[490, 740], [370, 740]], "", 0, 0, "", "data"],
+    ["finger_tracking", "timing", [[610, 754], [610, 810]], "fingertips: map x/y, on_paper", 616, 788, "start", "data"],
+    ["symbols_json", "timing", [[225, 122], [175, 122], [175, 858], [490, 858]], "extra boxes (optional)", 330, 852, "middle", "data"],
+    ["finger_tracking", "dashboard", [[730, 740], [770, 740], [770, 925], [700, 925], [700, 940]], "paths + session log", 776, 905, "start", "data"],
+    ["timing", "dashboard", [[610, 874], [610, 940]], "visits, totals, order", 604, 905, "end", "data"],
+    ["dashboard", "dash_json", [[730, 958], [790, 958]], "", 0, 0, "", "data"],
+    ["dashboard", "dash_html", [[730, 992], [790, 992]], "", 0, 0, "", "data"],
+    ["dashboard", "data_folder", [[610, 1004], [610, 1062]], "everything saved here", 616, 1038, "start", "data"],
+  ];
+
+  // ------------------------------------------------------------------ render
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.getElementById("diagram");
+  const el = (tag, attrs, parent) => {
+    const n = document.createElementNS(NS, tag);
+    for (const k in attrs) n.setAttribute(k, attrs[k]);
+    (parent || svg).appendChild(n);
+    return n;
+  };
+  for (const [y0, y1, name, sub] of BANDS) {
+    el("rect", { x: 0, y: y0, width: 1210, height: y1 - y0, class: "band", rx: 6 });
+    const t = el("text", { x: 12, y: y0 + 22, class: "band-label" });
+    t.textContent = name;
+    const s = el("text", { x: 12, y: y0 + 38, class: "band-sub" });
+    s.textContent = sub;
+  }
+  el("rect", { x: 182, y: 405, width: 1003, height: 495, rx: 14, class: "loop" });
+  const lt = el("text", { x: 1176, y: 424, "text-anchor": "end", class: "loop-label" });
+  lt.textContent = "repeats for every video frame (run_pipeline.py's loop)";
+
+  const edgeEls = [];
+  const edgeLayer = el("g", {});
+  for (const [from, to, pts, label, lx, ly, anchor, kind] of EDGES) {
+    const g = el("g", { class: "edge " + kind }, edgeLayer);
+    const d = pts.map((p, i) => (i ? "L" : "M") + p[0] + " " + p[1]).join(" ");
+    el("path", { d }, g);
+    const [ax, ay] = pts[pts.length - 2], [bx, by] = pts[pts.length - 1];
+    const ang = Math.atan2(by - ay, bx - ax), s = 8;
+    const p1 = [bx - s * Math.cos(ang - 0.42), by - s * Math.sin(ang - 0.42)];
+    const p2 = [bx - s * Math.cos(ang + 0.42), by - s * Math.sin(ang + 0.42)];
+    el("polygon", { points: `${bx},${by} ${p1[0]},${p1[1]} ${p2[0]},${p2[1]}` }, g);
+    if (label) {
+      const t = el("text", { x: lx, y: ly, "text-anchor": anchor }, g);
+      t.textContent = label;
+    }
+    edgeEls.push({ from, to, g });
+  }
+
+  const nodeEls = {};
+  for (const [id, x, y, w, h, title, sub, kind] of NODES) {
+    const chip = kind.includes("chip");
+    const g = el("g", { class: "node " + kind, tabindex: 0, role: "button",
+      "aria-label": FILES[id].title + " — " + FILES[id].kind }, svg);
+    el("rect", { x, y, width: w, height: h, rx: chip ? 12 : 9 }, g);
+    if (chip) {
+      const t = el("text", { x: x + w / 2, y: y + h / 2 + 4, "text-anchor": "middle", class: "title" }, g);
+      t.textContent = title;
+    } else {
+      const t = el("text", { x: x + w / 2, y: y + (sub ? h / 2 - 3 : h / 2 + 5), "text-anchor": "middle", class: "title" }, g);
+      t.textContent = title;
+      if (sub) {
+        const s = el("text", { x: x + w / 2, y: y + h / 2 + 14, "text-anchor": "middle", class: "subtitle" }, g);
+        s.textContent = sub;
+      }
+    }
+    g.addEventListener("click", () => select(id));
+    g.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(id); } });
+    nodeEls[id] = g;
+  }
+
+  // ------------------------------------------------------------------ panel
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const panel = document.getElementById("panel");
+  function list(items) { return "<ul>" + items.map((i) => `<li>${esc(i)}</li>`).join("") + "</ul>"; }
+  function links(ids) {
+    return '<div class="links">' + ids.filter((i) => FILES[i]).map((i) =>
+      `<button type="button" data-go="${i}">${esc(FILES[i].title)}</button>`).join("") + "</div>";
+  }
+  function select(id) {
+    const f = FILES[id];
+    svg.classList.add("has-sel");
+    const near = new Set([id]);
+    for (const e of edgeEls) {
+      const on = e.from === id || e.to === id;
+      e.g.classList.toggle("on", on);
+      if (on) { near.add(e.from); near.add(e.to); }
+    }
+    for (const k in nodeEls) {
+      nodeEls[k].classList.toggle("selected", k === id);
+      nodeEls[k].classList.toggle("near", near.has(k) && k !== id);
+    }
+    const ins = edgeEls.filter((e) => e.to === id).map((e) => e.from);
+    const outs = edgeEls.filter((e) => e.from === id).map((e) => e.to);
+    let h = `<span class="kind">${esc(f.kind)}</span><span class="kind steps">${esc(f.steps)}</span>`;
+    h += `<h2>${esc(f.title)}</h2><p class="lead">${esc(f.lead)}</p>`;
+    if (f.body.length) h += "<h3>What it does</h3>" + f.body.map((p) => `<p>${esc(p)}</p>`).join("");
+    if (f.inputs.length) h += "<h3>Inputs</h3>" + list(f.inputs);
+    if (f.outputs.length) h += "<h3>Outputs</h3>" + list(f.outputs);
+    if (f.funcs.length) h += "<h3>Key functions</h3><table>" + f.funcs.map(([n, d]) =>
+      `<tr><td><code>${esc(n)}</code></td><td>${esc(d)}</td></tr>`).join("") + "</table>";
+    if (f.settings.length) h += "<h3>Settings</h3><table>" + f.settings.map(([n, v, d]) =>
+      `<tr><td><code>${esc(n)}</code></td><td class="val">${esc(v)}</td><td>${esc(d)}</td></tr>`).join("") + "</table>";
+    if (ins.length) h += "<h3>Arrows in (from)</h3>" + links(ins);
+    if (outs.length) h += "<h3>Arrows out (to)</h3>" + links(outs);
+    if (f.calls.length) h += "<h3>Imports / calls</h3>" + links(f.calls);
+    if (f.calledBy.length) h += "<h3>Used by</h3>" + links(f.calledBy);
+    if (f.notes.length) h += "<h3>Notes</h3>" + list(f.notes);
+    panel.innerHTML = h;
+    panel.scrollTop = 0;
+    for (const tr of document.querySelectorAll("#stepRows tr")) tr.classList.toggle("hl", tr.dataset.file === id);
+  }
+  panel.addEventListener("click", (e) => { const b = e.target.closest("[data-go]"); if (b) select(b.dataset.go); });
+
+  // ------------------------------------------------------------------ tables
+  const STEPS = [
+    ["1", "once", "Load the PNG; trace its lines into a graph; find rooms and symbols; write map.json and rooms.png.", "paper_locator"],
+    ["2", "first lock / lost", "Paper mask: Otsu brightness split, colorful (skin) pixels removed.", "paper_locator"],
+    ["3", "first lock / lost", "Starting outlines from paper blobs and from clusters of traced walls.", "paper_locator"],
+    ["4", "first lock / lost", "4 corner labelings per outline; score each with the rubric; refine the top 3; lock at ≥ 0.60 + outline check.", "paper_locator"],
+    ["5", "—", "Removed: manual alignment is now a separate tool (Space).", "manual_crop", true],
+    ["6", "every frame", "Search window: last frame's crop + 35%. Edge tracing is limited to it.", "paper_locator"],
+    ["7", "every frame*", "Separate paper blobs in the window (up to 3), nearest first.", "paper_locator"],
+    ["8", "every frame*", "Sort each straight paper edge into top / right / bottom / left.", "paper_locator"],
+    ["9", "every frame*", "Points every 4 px along each edge, weighted by angle match.", "corner_fitting"],
+    ["10", "every frame*", "Robust line of best fit per side.", "corner_fitting"],
+    ["11", "—", "Removed: reusing an old side line when a side looked hidden.", "corner_fitting", true],
+    ["12", "every frame*", "Intersect the side lines → 4 corners; ink-border fallback if no blob works.", "corner_fitting"],
+    ["13", "every frame", "Refine the crop so the PNG's lines sit on the traced lines (ICP); shift search if it slipped.", "corner_fitting"],
+    ["14", "every frame", "Sanity checks + the paper-outline check for every candidate.", "crop_checker"],
+    ["15", "every frame*", "Sub-pixel snap of clearly visible corners.", "corner_fitting"],
+    ["16", "every frame", "Paper didn't move → keep last frame's crop exactly.", "corner_fitting"],
+    ["17", "every frame", "Best candidate scoring ≥ 0.40 wins; 65% new / 35% old.", "corner_fitting"],
+    ["18", "if nothing passed", "Backup #1: SIFT against the PNG.", "crop_checker"],
+    ["19", "if nothing passed", "Backup #2: optical flow; else hold the crop.", "crop_checker"],
+    ["20", "if unconfirmed 20 frames", "Lost: whole-frame search every 3 frames.", "auto_crop"],
+    ["21", "every frame", "Rigid-paper correction; per-corner visibility.", "crop_checker"],
+    ["22", "every frame", "Crop around the paper, enlarge, MediaPipe → index fingertips.", "finger_tracking"],
+    ["23", "every frame", "Fingertip → PNG pixels through this frame's homography; on_paper flag.", "finger_tracking"],
+    ["24", "every frame", "Keep Left / Right straight (wrist matching + fading MediaPipe-label memory).", "finger_tracking"],
+    ["25", "every frame", "Step the paper / room / symbol / box timers (≥ 1 s visits).", "timing"],
+    ["26", "end of run", "Save everything into the run folder; build and open the dashboard.", "dashboard"],
+  ];
+  document.getElementById("stepRows").innerHTML = STEPS.map(([n, when, what, file, removed]) =>
+    `<tr data-file="${file}"${removed ? ' class="removed"' : ""}><td class="num">${n}</td><td>${esc(when)}</td><td>${esc(what)}</td>` +
+    `<td><button class="filebtn" type="button" data-go="${file}">${esc(FILES[file].title)}</button></td></tr>`).join("") +
+    `<tr><td></td><td colspan="3" class="hint">* only on frames where the traced-line crop (step 13) scores below 0.60, or during the first lock.</td></tr>`;
+  for (const tr of document.querySelectorAll("#stepRows tr[data-file]"))
+    tr.addEventListener("click", () => { select(tr.dataset.file); document.getElementById("diagram").scrollIntoView({ behavior: "smooth", block: "start" }); });
+
+  const OUTS = [
+    ["map_json", "paper_locator.py", "PNG lines as a graph, border, rooms (outlines), symbols"],
+    ["rooms_png", "room_tracking.py (RoomMap.draw)", "Picture of detected rooms and symbols"],
+    ["frame_lines", "auto_crop.py", "Lines traced from the first-lock frame + score breakdown"],
+    ["finger_paths", "finger_tracking.py", "Left (red) and right (blue) trails on the map"],
+    ["session_json", "finger_tracking.py", "Every frame: crop, source, score, fingertips"],
+    ["dash_json", "dashboard.py", "All results: timers, visits, order, paths"],
+    ["dash_html", "dashboard.py", "Interactive dashboard (offline, one file)"],
+  ];
+  document.getElementById("outRows").innerHTML = OUTS.map(([id, by, what]) =>
+    `<tr data-file="${id}"><td><button class="filebtn" type="button" data-go="${id}">${esc(FILES[id].title)}</button></td><td>${esc(by)}</td><td>${esc(what)}</td></tr>`).join("");
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest(".filebtn");
+    if (b) { e.stopPropagation(); select(b.dataset.go); }
+  });
+  for (const tr of document.querySelectorAll("#outRows tr")) tr.addEventListener("click", () => select(tr.dataset.file));
+
+  function overview() {
+    svg.classList.remove("has-sel");
+    for (const e of edgeEls) e.g.classList.remove("on");
+    for (const k in nodeEls) nodeEls[k].classList.remove("selected", "near");
+    for (const tr of document.querySelectorAll("#stepRows tr")) tr.classList.remove("hl");
+    panel.innerHTML = `<span class="kind">Overview</span><h2>How a run flows</h2>
+      <p class="lead">Click any box in the diagram to see what that file does. Click empty space to come back here.</p>
+      <h3>Top to bottom</h3>
+      <ol style="margin:0;padding-left:20px">
+        <li><b>Inputs</b> — the floorplan PNG, the session video, MediaPipe's hand model, and optionally hand-drawn boxes.</li>
+        <li><b>Start</b> — <code>run_pipeline.py</code> creates <code>data/&lt;date_time&gt;__&lt;map&gt;__&lt;video&gt;/</code>.</li>
+        <li><b>Know the map (once)</b> — trace the PNG's lines into a graph, find the rooms and symbols, write <code>map.json</code>.</li>
+        <li><b>Find &amp; follow the paper (every frame)</b> — search the whole frame until the map is found, then keep the 4 crop corners locked by lining up the PNG's printed lines with lines traced inside the crop. Every candidate is scored and checked; backups and recovery take over when needed.</li>
+        <li><b>Fingers (every frame)</b> — MediaPipe fingertips mapped onto the PNG, Left/Right kept stable.</li>
+        <li><b>Timers (every frame)</b> — enter/exit timers for the paper, every room and every symbol; visits ≥ 1 s count.</li>
+        <li><b>Results (end)</b> — <code>dashboard.json</code> and an interactive <code>dashboard.html</code>.</li>
+        <li><b>Run folder</b> — all 7 files saved together.</li>
+      </ol>
+      <h3>Reading the arrows</h3>
+      <ul><li>Solid arrow: data handed from one box to the next.</li><li>Dashed arrow: one file calling into another (the result comes back).</li><li>Orange frame: layers that repeat for every video frame.</li></ul>`;
+  }
+  svg.addEventListener("click", (e) => { if (!e.target.closest(".node")) overview(); });
+  const start = decodeURIComponent(location.hash.slice(1));
+  if (FILES[start]) select(start); else overview();
+})();
+</script>
+</body>
+</html>
