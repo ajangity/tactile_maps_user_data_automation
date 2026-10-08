@@ -1,8 +1,17 @@
-"""One-time labeling tool: click boxes on the reference map PNG and mark
+"""Optional extra boxes, drawn by hand on the reference map PNG.
+
+Rooms and symbols are now found automatically (room_tracking.py, saved in
+<map>.map.json), so this is only needed for an extra region the automatic
+detection doesn't cover. Each box drawn here gets its own timer too.
+
+Click boxes on the PNG and mark
 each one "symbol" (a legend icon) or "room" (a space the user's finger
-moves through). Names are auto-numbered ("Symbol 1", "Room 1", ...) -- no
-typing needed, just press 's' or 'r' then click the box's two opposite
-corners. Press 'u' to undo, 'd' when done. Saves <map>.symbols.json.
+moves through). Press 's' or 'r', then click the box's two opposite
+corners. You can then type a name for it right in the image window
+("Elevator", "Stairs", ...) and press Enter -- or just press Enter (or Esc)
+to keep the auto-numbered name ("Symbol 1", "Room 1", ...). Press 'u' to
+undo, 'd' when done. Saves <map>.symbols.json, with each box both as
+fractions of the image (what the tracker loads) and in PNG pixel coords.
 
 Everything happens inside the image window via keyboard, with no blocking
 terminal input() call -- that was what made the window look "Not
@@ -25,7 +34,6 @@ out_path = image_path.rsplit(".", 1)[0] + ".symbols.json"
 img = cv2.imread(image_path)
 if img is None:
     raise FileNotFoundError(image_path)
-img = cv2.rotate(img, cv2.ROTATE_180)  # matches how the tracker loads it
 h, w = img.shape[:2]
 
 boxes = {}             # name -> {"type":, "box":}
@@ -33,6 +41,8 @@ order = []              # insertion order, so undo removes the right one
 counts = {"symbol": 0, "room": 0}
 pending_type = None     # "symbol" or "room" while mid-click, else None
 clicks = []
+naming = None           # name of the just-drawn box while it's being renamed
+name_buffer = ""
 
 TYPE_COLORS = {"symbol": (0, 255, 0), "room": (255, 180, 0)}
 
@@ -47,7 +57,10 @@ def redraw():
         cv2.rectangle(shown, p0, p1, color, 2)
         cv2.putText(shown, name, (p0[0], p0[1] - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-    if pending_type:
+    if naming:
+        prompt = (f"name for {naming}: {name_buffer}_   "
+                  "(Enter = save, Esc = keep auto name)")
+    elif pending_type:
         prompt = (f"click 2 opposite corners for the next {pending_type} "
                  f"({len(clicks)}/2 so far)")
     else:
@@ -60,19 +73,39 @@ def redraw():
 
 
 def finish_box():
-    global pending_type, clicks
+    global pending_type, clicks, naming, name_buffer
     (x0, y0), (x1, y1) = clicks
     counts[pending_type] += 1
     name = f"{pending_type.capitalize()} {counts[pending_type]}"
+    while name in boxes:   # a custom name may already have taken it
+        name += "+"
+    px = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
     boxes[name] = {
         "type": pending_type,
-        "box": (min(x0, x1) / w, min(y0, y1) / h,
-                max(x0, x1) / w, max(y0, y1) / h),
+        "box": (px[0] / w, px[1] / h, px[2] / w, px[3] / h),
+        # same box in pixels of the rotated PNG shown in this window
+        "box_px": px,
+        "space": "png",   # PNG's own orientation (older files were rotated 180)
     }
     order.append(name)
-    print(f"  saved {name}")
     pending_type = None
     clicks = []
+    naming, name_buffer = name, ""
+
+
+def finish_naming(keep_typed):
+    """Rename the just-drawn box to whatever was typed (if anything)."""
+    global naming, name_buffer
+    new = name_buffer.strip()
+    if keep_typed and new and new != naming:
+        if new in boxes:
+            print(f"  '{new}' is already used -- keeping {naming}")
+        else:
+            boxes[new] = boxes.pop(naming)
+            order[order.index(naming)] = new
+            naming = new
+    print(f"  saved {naming}")
+    naming, name_buffer = None, ""
 
 
 def undo():
@@ -93,7 +126,7 @@ def undo():
 
 def on_click(event, x, y, flags, param):
     global clicks
-    if event != cv2.EVENT_LBUTTONDOWN or pending_type is None:
+    if event != cv2.EVENT_LBUTTONDOWN or pending_type is None or naming:
         return
     clicks.append((x, y))
     if len(clicks) == 2:
@@ -104,11 +137,23 @@ cv2.namedWindow("label_symbols", cv2.WINDOW_AUTOSIZE)
 cv2.setMouseCallback("label_symbols", on_click)
 
 print("s = start a symbol box, r = start a room box, then click its two opposite")
-print("corners in the image window. u = undo, d = done. Names are auto-numbered.")
+print("corners in the image window. Then type a name in the window and press")
+print("Enter (or just Enter/Esc to keep the auto number). u = undo, d = done.")
 
 while True:
     redraw()
     key = cv2.waitKey(20) & 0xFF
+    if naming:
+        # While naming, every key is text, so s/r/u/d don't trigger commands.
+        if key in (10, 13):
+            finish_naming(keep_typed=True)
+        elif key == 27:
+            finish_naming(keep_typed=False)
+        elif key in (8, 127):
+            name_buffer = name_buffer[:-1]
+        elif 32 <= key < 127:
+            name_buffer += chr(key)
+        continue
     if key == ord("s") and pending_type is None:
         pending_type = "symbol"
         clicks = []

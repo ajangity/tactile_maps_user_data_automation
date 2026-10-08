@@ -1,11 +1,14 @@
 import argparse
 import math
 import os
+import pathlib
 import time
+import webbrowser
 
 import cv2
 import numpy as np
 
+from dashboard import build_dashboard
 from data_collection import FingerDataCollector, load_symbol_boxes
 
 from trace_map import ink_mask, trace_walls, find_symbol_blobs, classify_shape
@@ -20,13 +23,8 @@ MAX_REPROJECTION_ERROR = 3.0     # pixels in the video frame
 MAX_FRAME_MOTION = 0.12          # fraction of frame diagonal per frame
 PAGE_POSE_SMOOTHING = 0.65       # high = responsive; lower if the camera is noisy
 DEFAULT_PLAYBACK_SPEED = 1.5     # processes every frame; only display timing changes
-FINGER_SMOOTHING = 0.35          # lower = smoother
-MAX_FINGER_JUMP = 140.0          # map pixels; rejects detections after occlusion
-MAX_MISSED_FRAMES = 20
+# Finger smoothing/jump/miss and box-timer settings live in data_collection.py.
 MAX_UNCONFIRMED_FRAMES = 20      # ~0.7s @30fps of pure flow/hold before
-                                 # distrusting the lock (it may have drifted
-                                 # onto a hand or the wrong sheet) and
-                                 # re-searching the whole frame. Was 45
                                  # distrusting the lock (it may have drifted
                                  # onto a hand or the wrong sheet) and
                                  # re-searching the whole frame. Was 45
@@ -75,6 +73,7 @@ active_pt_idx = -1
 is_paused = True
 show_edge_debug = False
 show_wall_trace = False
+show_trails = False
 window_scale = 1.0     # video-frame -> displayed-window scale factor, kept in
 window_offset = (0, 0) # sync with show_scaled() so mouse_handler can map a
                         # click in the (resizable, letterboxed) window back to
@@ -383,11 +382,14 @@ def _order_quad_points(pts):
 
 
 def _quad_relabelings(quad):
-    """The 4 ways to relabel a quad's TL/TR/BR/BL corners that a cold-start
-    fit (no prior to say which visible side is really 'top') could have
-    produced: as-is, top/bottom swapped, left/right swapped, and both."""
+    """The 4 physically possible orientations of a cold-start quad (no prior
+    to say which visible side is really 'top'): the page rotated 0, 90, 180
+    or 270 degrees. Cyclic shifts of TL/TR/BR/BL keep the corners' winding,
+    so none of these is a mirror image -- a flipped page would be face-down,
+    and the old top/bottom- and left/right-swapped labelings were exactly
+    that, which SIFT could only ever score poorly."""
     q = np.asarray(quad, np.float32)
-    return [q[[0, 1, 2, 3]], q[[3, 2, 1, 0]], q[[1, 0, 3, 2]], q[[2, 3, 0, 1]]]
+    return [q[[0, 1, 2, 3]], q[[1, 2, 3, 0]], q[[2, 3, 0, 1]], q[[3, 0, 1, 2]]]
 
 
 def _valid_quad_geometry(quad, w, h, ref_aspect=None):
@@ -634,15 +636,25 @@ class PaperEdgeDetector:
         fed as a *prior* into the same angle+position side classifier
         _fit_quad already uses for per-frame tracking, so line fitting is as
         robust here as it is once locked on. The resulting quad is expanded
-        into all 4 axis relabelings (top/bottom and left/right are still an
+        into all 4 rotations (which side is really 'top' is still an
         arbitrary choice at this point) so the caller can pick the one
         that's actually right-side up, e.g. via feature matching.
+
+        The aspect-ratio check is deferred until after rotating: a page
+        lying sideways to the camera has the reference's aspect inverted in
+        image order, so checking before rotating rejected it outright.
+
+        Same ink-border fallback as per-frame tracking (see track()): if a
+        blob's paper-vs-desk boundary doesn't produce a valid quad, the
+        same padded region is retried against the printed ink, so the
+        cold start and full-frame recovery get the edge-tracing fallback too.
         """
         h, w = frame.shape[:2]
         mask = _paper_mask(frame)
         num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         frame_area = w * h
         candidates = []
+        ink = None   # computed lazily, only if some blob needs the fallback
         for i in range(1, num):
             if stats[i, cv2.CC_STAT_AREA] < 0.03 * frame_area:
                 continue
@@ -661,16 +673,25 @@ class PaperEdgeDetector:
             # blob, not mask: keep this candidate isolated from any other
             # paper-colored blob whose padded bbox happens to overlap here.
             quad, _, _ = self._fit_quad(frame, blob[y0:y1, x0:x1], x0, y0,
-                                        rough_quad, {}, check_stable=False)
+                                        rough_quad, {}, check_stable=False,
+                                        check_aspect=False)
+            if quad is None:
+                if ink is None:
+                    ink = _ink_border_mask(frame)
+                quad, _, _ = self._fit_quad(frame, ink[y0:y1, x0:x1], x0, y0,
+                                            rough_quad, {}, check_stable=False,
+                                            check_aspect=False)
             if quad is not None:
-                candidates.extend(_quad_relabelings(quad))
+                candidates.extend(
+                    q for q in _quad_relabelings(quad)
+                    if _valid_quad_geometry(q, w, h, self.ref_aspect))
         return candidates
 
     def reset(self):
         self.last_valid = {}
 
     def _fit_quad(self, frame, crop_mask, x0, y0, prior, last_valid,
-                  check_stable=True):
+                  check_stable=True, check_aspect=True):
         not_visible = [False, False, False, False]
         if crop_mask.shape[1] < 20 or crop_mask.shape[0] < 20:
             return None, {}, not_visible
@@ -715,7 +736,8 @@ class PaperEdgeDetector:
             return None, fresh_lines, not_visible
         quad = np.array([tl, tr, br, bl], np.float32)
         h, w = frame.shape[:2]
-        if not _valid_quad_geometry(quad, w, h, self.ref_aspect):
+        if not _valid_quad_geometry(quad, w, h,
+                                    self.ref_aspect if check_aspect else None):
             return None, fresh_lines, not_visible
 
         # A corner whose both adjacent sides were actually seen this frame is
@@ -1290,8 +1312,12 @@ def draw_wall_trace_debug(shown, frame, frame_h, corners):
 
 
 def manual_keyframe_tracking(video_path, reference_image_path,
-                             output_path="finger_paths.png"):
-    global drag_pts, is_paused, ui_mode, show_edge_debug, show_wall_trace
+                             output_path="finger_paths.png", display=True,
+                             open_dashboard=True):
+    """display=False runs start-to-finish with no window at all (batch
+    mode) -- only possible when the page is auto-located on the first
+    frame, since otherwise a person has to place the corners by hand."""
+    global drag_pts, is_paused, ui_mode, show_edge_debug, show_wall_trace, show_trails
     ref_img = cv2.imread(reference_image_path)
     if ref_img is None:
         raise FileNotFoundError(reference_image_path)
@@ -1313,6 +1339,12 @@ def manual_keyframe_tracking(video_path, reference_image_path,
         print("Automatically located the page corners -- starting tracking "
               "automatically, no confirmation needed. Press 'q' during "
               "tracking if you want to stop and fix the corners by hand.")
+    elif not display:
+        cap.release()
+        raise SystemExit(
+            "Could not automatically locate the page on the first frame, and "
+            "--no-display leaves no way to place the corners by hand. Re-run "
+            "without --no-display to align it manually.")
     else:
         drag_pts = [[100, 100], [frame_w - 100, 100],
                     [frame_w - 100, frame_h - 100], [100, frame_h - 100]]
@@ -1320,13 +1352,14 @@ def manual_keyframe_tracking(video_path, reference_image_path,
               "map corner; the nearest green handle will follow. Press Enter "
               "when aligned.")
 
-    # NORMAL (resizable) rather than AUTOSIZE so the user can size the window
-    # to their screen; show_scaled()/mouse_handler keep the displayed image
-    # and click coordinates correctly mapped to the video frame regardless of
-    # the window's current size.
-    cv2.namedWindow("Video Tracker", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Video Tracker", frame_w, frame_h)
-    cv2.setMouseCallback("Video Tracker", mouse_handler)
+    if display:
+        # NORMAL (resizable) rather than AUTOSIZE so the user can size the
+        # window to their screen; show_scaled()/mouse_handler keep the
+        # displayed image and click coordinates correctly mapped to the video
+        # frame regardless of the window's current size.
+        cv2.namedWindow("Video Tracker", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Video Tracker", frame_w, frame_h)
+        cv2.setMouseCallback("Video Tracker", mouse_handler)
     ui_mode = "align"
     if auto_quad is None:
         # A human has to place the corners by hand here -- there's no way
@@ -1370,8 +1403,13 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     detection_count = 0
     display_markers = []
     playback_speed = DEFAULT_PLAYBACK_SPEED
-    print("Tracking. Space pauses/resumes; e toggles the edge-detection debug "
-          "overlay; w toggles the wall/symbol trace overlay; q saves and quits.")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if display:
+        print("Tracking. Space pauses/resumes; e toggles the edge-detection "
+              "debug overlay; w toggles the wall/symbol trace overlay; t "
+              "toggles live finger trails + labeled boxes; q saves and quits.")
+    else:
+        print("Tracking with no display (batch mode)...")
     while True:
         loop_started = time.perf_counter()
         if not is_paused:
@@ -1385,7 +1423,15 @@ def manual_keyframe_tracking(video_path, reference_image_path,
             frame_index += 1
             timestamp_ms = int(round(1000.0 * frame_index / fps))
             display_markers, detection_count = collector.update(
-                frame, corners, frame_index, timestamp_ms)
+                frame, corners, frame_index, timestamp_ms,
+                page_source=pose.source)
+
+        if not display:
+            if frame_index % int(round(10 * fps)) == 0:
+                done = f"/{total_frames}" if total_frames else ""
+                print(f"  frame {frame_index}{done}  "
+                      f"({timestamp_ms / 1000.0:.0f}s of video)  map: {pose.source}")
+            continue
 
         corners = np.asarray(drag_pts, np.float32)
         H_map_to_frame = cv2.getPerspectiveTransform(ref_corners, corners)
@@ -1414,7 +1460,8 @@ def manual_keyframe_tracking(video_path, reference_image_path,
                         "PAUSED: click/drag a corner; Space resumes",
                         (18, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                         (0, 255, 255), 2, cv2.LINE_AA)
-        if show_wall_trace:
+        if show_trails:
+            collector.draw_boxes_in_frame(shown, H_map_to_frame)
             collector.draw_trails_in_frame(shown, H_map_to_frame)
         # Show only fingertips detected in this frame. Persisted/smoothed tracks
         # are for output traces and must not create a duplicate marker on one hand.
@@ -1453,9 +1500,14 @@ def manual_keyframe_tracking(video_path, reference_image_path,
         elif key == ord("w"):
             show_wall_trace = not show_wall_trace
             print(f"Wall trace overlay: {'on' if show_wall_trace else 'off'}")
+        elif key == ord("t"):
+            show_trails = not show_trails
+            print(f"Live trails + boxes: {'on' if show_trails else 'off'}")
         elif key == ord("q"):
             break
 
+    # Everything below runs automatically once the video ends (or on q):
+    # trail image, per-frame log, metrics JSON, and the HTML dashboard.
     final_canvas = ref_img.copy()
     collector.draw_trails(final_canvas)
     # The video overlay is intentionally rotated 180 degrees, but the saved
@@ -1465,14 +1517,21 @@ def manual_keyframe_tracking(video_path, reference_image_path,
     session_log_path = os.path.splitext(output_path)[0] + ".session.json"
     collector.save_session_log(session_log_path)
     final_timestamp_ms = int(round(1000.0 * frame_index / fps))
-    if collector.symbol_boxes:
-        stats_path = os.path.splitext(video_path)[0] + ".dashboard.json"
-        collector.save_dashboard_data(stats_path, final_timestamp_ms, reference_image_path)
+    data_path = os.path.splitext(video_path)[0] + ".dashboard.json"
+    data = collector.save_dashboard_data(data_path, final_timestamp_ms,
+                                         reference_image_path,
+                                         video_path=video_path, fps=fps)
+    html_path = os.path.splitext(video_path)[0] + ".dashboard.html"
+    build_dashboard(data, reference_image_path, html_path)
     collector.close()
     cap.release()
-    cv2.destroyAllWindows()
+    if display:
+        cv2.destroyAllWindows()
     print(f"Saved {output_path}")
     print(f"Saved {session_log_path}")
+    print(f"Saved {html_path}")
+    if open_dashboard:
+        webbrowser.open(pathlib.Path(html_path).resolve().as_uri())
 
 
 if __name__ == "__main__":
@@ -1480,5 +1539,12 @@ if __name__ == "__main__":
     parser.add_argument("video", nargs="?", default="S-18 5-12-26 PT2 E.mp4")
     parser.add_argument("map", nargs="?", default="distractor_floorplan_E.png")
     parser.add_argument("-o", "--output", default="finger_paths.png")
+    parser.add_argument("--no-display", action="store_true",
+                        help="run with no window (needs the page to be "
+                             "auto-located on the first frame)")
+    parser.add_argument("--no-open", action="store_true",
+                        help="don't open the HTML dashboard when finished")
     args = parser.parse_args()
-    manual_keyframe_tracking(args.video, args.map, args.output)
+    manual_keyframe_tracking(args.video, args.map, args.output,
+                             display=not args.no_display,
+                             open_dashboard=not args.no_open)

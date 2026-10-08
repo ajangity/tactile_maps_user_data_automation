@@ -29,6 +29,10 @@ FINGER_SMOOTHING = 0.35          # lower = smoother
 MAX_FINGER_JUMP = 140.0          # map pixels; rejects detections after occlusion
 MAX_MISSED_FRAMES = 20
 MIN_VISIT_MS = 1000              # a dwell shorter than this isn't a real "visit"
+EXIT_GRACE_MS = 400              # a finger must be out of a box this long
+                                 # before the visit ends -- MediaPipe drops a
+                                 # hand for a few frames at a time, and that
+                                 # shouldn't split one visit into several
 
 
 def create_hand_landmarker(model_path="hand_landmarker.task"):
@@ -73,6 +77,17 @@ class FingerTrack:
         self.name = name
         self.missed = 0
         self.samples = []       # None marks a break in the rendered path
+        # Running tally of MediaPipe's per-frame "Left"/"Right" guesses for
+        # this physical hand. MediaPipe's label can flip on any single frame,
+        # but its majority over a hand's whole history is reliable.
+        self.votes = {"Left": 0, "Right": 0}
+
+    def vote(self, handedness):
+        self.votes[handedness] = self.votes.get(handedness, 0) + 1
+
+    def lean(self):
+        """> 0 leans Left, < 0 leans Right, 0 undecided."""
+        return self.votes.get("Left", 0) - self.votes.get("Right", 0)
 
     def update(self, point):
         point = np.asarray(point, np.float32)
@@ -101,11 +116,17 @@ class FingerTrack:
 
 
 def assign_detections(tracks, detections):
-    """Associate by position, not MediaPipe handedness (which often flips)."""
+    """Associate by position, not MediaPipe handedness (which often flips).
+
+    Returns owners, where owners[j] is the track that detection j was
+    assigned to (or None if it couldn't be given to any track).
+    """
+    owners = [None] * len(detections)
     if not tracks:
-        for i, p in enumerate(sorted(detections, key=lambda q: q[0])):
-            tracks.append(FingerTrack(p, f"Finger {i + 1}"))
-        return
+        for j in sorted(range(len(detections)), key=lambda k: detections[k][0]):
+            owners[j] = FingerTrack(detections[j], f"Finger {len(tracks) + 1}")
+            tracks.append(owners[j])
+        return owners
     # Solve the two-hand assignment jointly. Greedy matching can let the first
     # track steal the second hand's detection and make the other marker vanish.
     if len(tracks) == 2 and len(detections) == 2:
@@ -116,13 +137,15 @@ def assign_detections(tracks, detections):
         order = (0, 1) if direct <= crossed else (1, 0)
         for track, j in zip(tracks, order):
             track.update(detections[j])
-        return
+            owners[j] = track
+        return owners
     if len(tracks) == 2 and len(detections) == 1:
         chosen = min(range(2), key=lambda i: np.linalg.norm(
             detections[0] - tracks[i].point))
         tracks[chosen].update(detections[0])
         tracks[1 - chosen].miss()
-        return
+        owners[0] = tracks[chosen]
+        return owners
     unused = set(range(len(detections)))
     for track in tracks:
         if not unused:
@@ -131,12 +154,42 @@ def assign_detections(tracks, detections):
         j = min(unused, key=lambda k: np.linalg.norm(detections[k] - track.point))
         if np.linalg.norm(detections[j] - track.point) <= MAX_FINGER_JUMP:
             track.update(detections[j])
+            owners[j] = track
             unused.remove(j)
         else:
             track.miss()
-    for j in unused:
+    for j in sorted(unused):
         if len(tracks) < 2:
-            tracks.append(FingerTrack(detections[j], f"Finger {len(tracks) + 1}"))
+            owners[j] = FingerTrack(detections[j], f"Finger {len(tracks) + 1}")
+            tracks.append(owners[j])
+    return owners
+
+
+def label_detections(owners, raw_handedness):
+    """Stable "Left"/"Right" label for each owned detection this frame.
+
+    Each label comes from its track's accumulated vote, not from MediaPipe's
+    guess on this one frame, so a one-frame handedness flip can't swap which
+    trail/log/box timer a point lands in. When two hands are visible they
+    always get different labels: whichever track leans more Left gets Left.
+    A track with no lean yet (a tie) falls back to this frame's raw label.
+    """
+    labels = [None] * len(owners)
+    active = [j for j, t in enumerate(owners) if t is not None]
+    if len(active) == 1:
+        j = active[0]
+        lean = owners[j].lean()
+        labels[j] = raw_handedness[j] if lean == 0 else (
+            "Left" if lean > 0 else "Right")
+    elif len(active) == 2:
+        a, b = active
+        diff = owners[a].lean() - owners[b].lean()
+        if diff == 0:
+            a_left = raw_handedness[a] == "Left" or raw_handedness[b] == "Right"
+        else:
+            a_left = diff > 0
+        labels[a], labels[b] = ("Left", "Right") if a_left else ("Right", "Left")
+    return labels
 
 
 def in_box(pt, box):
@@ -158,6 +211,9 @@ def load_symbol_boxes(map_path, ref_w, ref_h):
         raw = json.load(f)
     boxes = {}
     for name, entry in raw.items():
+        if isinstance(entry, (list, tuple)):
+            # Pre-room/symbol format: name -> [fx0, fy0, fx1, fy1], symbols only.
+            entry = {"type": "symbol", "box": entry}
         fx0, fy0, fx1, fy1 = entry["box"]
         boxes[name] = {
             "type": entry["type"],
@@ -170,25 +226,81 @@ def load_symbol_boxes(map_path, ref_w, ref_h):
     return boxes
 
 
-def update_symbol_timer(state, stats, handedness, in_region, timestamp_ms, symbol):
-    # start/stop per hand per box; closed intervals roll into stats as a
-    # visit count + total dwell time, but only once they clear MIN_VISIT_MS --
-    # a shorter touch doesn't count as a real visit, just passing over it.
-    # "entered" is separate and set the instant the finger is in the box at
-    # all, regardless of duration, so a box that was only ever brushed isn't
-    # reported as having been missed entirely.
-    entry = stats[symbol]
-    key = (handedness, symbol)
-    if in_region:
-        entry["entered"] = True
-        if key not in state:
-            state[key] = timestamp_ms
-    elif key in state:
-        start = state.pop(key)
-        duration = timestamp_ms - start
+class BoxTimer:
+    """Enter/exit timer for one labeled box (symbol or room).
+
+    Timed per *user*, not per hand: the box is occupied while any fingertip
+    is inside it, so two hands in the same room count once, not twice. A
+    visit starts the first frame a finger is inside, and ends at the last
+    frame one was inside -- once no finger has been in it for EXIT_GRACE_MS.
+    That grace period also covers a hand simply vanishing (lifted off the
+    page, or MediaPipe missing it), which previously left the timer running
+    until the hand happened to be seen again somewhere else.
+
+    Visits shorter than MIN_VISIT_MS are just a finger passing over the box:
+    counted as "brushes", not visits, and kept out of total time.
+    """
+
+    def __init__(self, name, box_type, box):
+        self.name = name
+        self.type = box_type
+        self.box = box
+        self.visits = []        # {"enter_ms", "exit_ms", "duration_ms", "hands"}
+        self.brushes = 0
+        self._start = None
+        self._last_inside = None
+        self._hands = set()
+
+    def step(self, hands_inside, timestamp_ms):
+        """hands_inside: set of hand labels whose fingertip is in the box."""
+        if hands_inside:
+            if self._start is None:
+                self._start = timestamp_ms
+                self._hands = set()
+            self._hands |= hands_inside
+            self._last_inside = timestamp_ms
+        elif (self._start is not None and
+              timestamp_ms - self._last_inside > EXIT_GRACE_MS):
+            self.close()
+
+    def close(self):
+        """End any open visit (also called once when the video ends)."""
+        if self._start is None:
+            return
+        duration = self._last_inside - self._start
         if duration >= MIN_VISIT_MS:
-            entry["visits"] += 1
-            entry["total_ms"] += duration
+            self.visits.append({"enter_ms": self._start,
+                                "exit_ms": self._last_inside,
+                                "duration_ms": duration,
+                                "hands": sorted(self._hands)})
+        else:
+            self.brushes += 1
+        self._start = None
+
+    @property
+    def occupied(self):
+        return self._start is not None
+
+    def summary(self):
+        durations = [v["duration_ms"] for v in self.visits]
+        touched = bool(self.visits) or self.brushes > 0
+        status = ("visited" if self.visits else
+                  "brushed" if touched else "missed")
+        return {
+            "type": self.type,
+            "box_px": [round(float(v), 1) for v in self.box],
+            # visited = at least one visit >= MIN_VISIT_MS; brushed = touched
+            # but never that long; missed = the finger never entered at all
+            "status": status,
+            "touched": touched,
+            "missed": not touched,
+            "visits": len(self.visits),
+            "brushes": self.brushes,
+            "total_ms": int(sum(durations)),
+            "longest_ms": int(max(durations, default=0)),
+            "first_enter_ms": self.visits[0]["enter_ms"] if self.visits else None,
+            "events": self.visits,
+        }
 
 
 def draw_trail(canvas, samples, color):
@@ -237,18 +349,22 @@ class FingerDataCollector:
         self.tracks = []
         self.raw_paths = {"Left": [], "Right": []}
         self.session_log = []
-        self.symbol_timers = {}
-        self.symbol_stats = {
-            name: {"type": entry["type"], "entered": False,
-                  "visits": 0, "total_ms": 0}
+        # one independent enter/exit timer per labeled box -- any number of
+        # symbols and rooms, each its own instance
+        self.box_timers = {
+            name: BoxTimer(name, entry["type"], entry["box"])
             for name, entry in self.symbol_boxes.items()
         }
 
-    def update(self, frame, corners, frame_index, timestamp_ms):
+    def update(self, frame, corners, frame_index, timestamp_ms, page_source=None):
         """Detect fingertips in this frame and record them. Returns
         (display_markers, detection_count) for the caller to draw --
         display_markers is a list of ((frame_x, frame_y), handedness) for
         only the hands actually seen this exact frame.
+
+        page_source is how the paper's corners were found this frame
+        (edge/PNG/flow/held/lost...), logged so the dashboard can show how
+        trustworthy each stretch of the session's data is.
         """
         corners = np.asarray(corners, np.float32)
         H_frame_to_map = cv2.getPerspectiveTransform(corners, self.ref_corners)
@@ -258,9 +374,8 @@ class FingerDataCollector:
             data=cv2.cvtColor(hand_image, cv2.COLOR_BGR2RGB)), timestamp_ms)
 
         detections = []
-        display_markers = []
-        seen_hands = set()
-        frame_positions = {}
+        frame_points = []
+        raw_handedness = []
         if result.hand_landmarks:
             for hand_i, landmarks in enumerate(result.hand_landmarks):
                 tip = landmarks[8]
@@ -274,21 +389,40 @@ class FingerDataCollector:
                 if (-margin_x <= mapped[0] < self.ref_w + margin_x and
                         -margin_y <= mapped[1] < self.ref_h + margin_y):
                     detections.append(mapped)
-                    handedness = result.handedness[hand_i][0].category_name
-                    display_markers.append(((int(round(frame_x)),
-                                             int(round(frame_y))),
-                                            handedness))
-                    self.raw_paths.setdefault(handedness, []).append(
-                        tuple(np.rint(mapped).astype(int)))
-                    seen_hands.add(handedness)
-                    frame_positions[handedness] = {
-                        "frame_x": float(frame_x), "frame_y": float(frame_y),
-                        "map_x": float(mapped[0]), "map_y": float(mapped[1]),
-                    }
-                    for name, entry in self.symbol_boxes.items():
-                        update_symbol_timer(self.symbol_timers, self.symbol_stats,
-                                            handedness, in_box(mapped, entry["box"]),
-                                            timestamp_ms, name)
+                    frame_points.append((float(frame_x), float(frame_y)))
+                    raw_handedness.append(
+                        result.handedness[hand_i][0].category_name)
+
+        # Identity comes from position continuity (which physical hand was
+        # closest last frame), then each hand's Left/Right label from that
+        # track's accumulated vote -- so MediaPipe flipping its label on one
+        # frame can no longer swap which trail, log entry or timer it feeds.
+        owners = assign_detections(self.tracks, detections)
+        for track, handedness in zip(owners, raw_handedness):
+            if track is not None:
+                track.vote(handedness)
+        labels = label_detections(owners, raw_handedness)
+
+        display_markers = []
+        seen_hands = set()
+        frame_positions = {}
+        for mapped, (frame_x, frame_y), raw, handedness in zip(
+                detections, frame_points, raw_handedness, labels):
+            if handedness is None:
+                # No track could take this detection (rare: a 3rd candidate
+                # while 2 hands are already tracked) -- recording it under a
+                # guessed label could put it on the other hand's trail.
+                continue
+            display_markers.append(((int(round(frame_x)), int(round(frame_y))),
+                                    handedness))
+            self.raw_paths.setdefault(handedness, []).append(
+                tuple(np.rint(mapped).astype(int)))
+            seen_hands.add(handedness)
+            frame_positions[handedness] = {
+                "frame_x": frame_x, "frame_y": frame_y,
+                "map_x": float(mapped[0]), "map_y": float(mapped[1]),
+                "mediapipe_label": raw,
+            }
         # A None creates a visible break rather than connecting across an
         # interval in which MediaPipe did not actually see that hand.
         for handedness, samples in self.raw_paths.items():
@@ -296,16 +430,26 @@ class FingerDataCollector:
                     samples[-1] is not None):
                 samples.append(None)
 
-        assign_detections(self.tracks, detections)
+        # Every box steps every frame, even with no hand in view, so a visit
+        # ends when the finger leaves (or disappears), not whenever it's next seen.
+        for timer in self.box_timers.values():
+            inside = {hand for hand, pos in frame_positions.items()
+                      if in_box((pos["map_x"], pos["map_y"]), timer.box)}
+            timer.step(inside, timestamp_ms)
 
         self.session_log.append({
             "frame": frame_index,
             "t_ms": timestamp_ms,
+            "page_source": page_source,
             "Left": frame_positions.get("Left"),
             "Right": frame_positions.get("Right"),
         })
 
-        return display_markers, len(detections)
+        return display_markers, len(display_markers)
+
+    def occupied_boxes(self):
+        """Names of boxes a finger is currently in (for the live overlay)."""
+        return [name for name, t in self.box_timers.items() if t.occupied]
 
     def draw_trails(self, canvas):
         draw_trail(canvas, self.raw_paths.get("Left", []), (0, 0, 255))
@@ -323,6 +467,26 @@ class FingerDataCollector:
         right = _warp_points(self.raw_paths.get("Right", []), h_map_to_frame)
         draw_trail(canvas, left, (0, 0, 255))
         draw_trail(canvas, right, (255, 0, 0))
+
+    def draw_boxes_in_frame(self, canvas, h_map_to_frame):
+        """Outline every labeled box on the live video frame (warped through
+        this frame's map->frame homography, like the trails), filled in
+        while a finger is currently inside it, so the timers can be checked
+        against what's actually happening on screen."""
+        type_colors = {"symbol": (0, 200, 0), "room": (255, 180, 0)}
+        for name, timer in self.box_timers.items():
+            x0, y0, x1, y1 = timer.box
+            quad = np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+            pts = cv2.perspectiveTransform(quad[None], h_map_to_frame)[0]
+            pts = np.int32(np.rint(pts))
+            color = type_colors.get(timer.type, (200, 200, 200))
+            if timer.occupied:
+                fill = canvas.copy()
+                cv2.fillConvexPoly(fill, pts, color)
+                cv2.addWeighted(fill, 0.35, canvas, 0.65, 0, dst=canvas)
+            cv2.polylines(canvas, [pts], True, color, 2, cv2.LINE_AA)
+            cv2.putText(canvas, name, tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, color, 1, cv2.LINE_AA)
 
     def save_session_log(self, path):
         with open(path, "w", encoding="utf-8") as f:
@@ -343,39 +507,45 @@ class FingerDataCollector:
                                "t_ms": record["t_ms"]})
         return points
 
-    def save_dashboard_data(self, path, final_timestamp_ms, map_path):
+    def save_dashboard_data(self, path, final_timestamp_ms, map_path,
+                            video_path=None, fps=None):
         """One consolidated, dashboard-ready JSON: every labeled box with its
-        type, pixel coordinates, whether it was ever entered at all (so a
-        box nobody ever touched is reported as missed, not silently absent),
-        >=1s visit count + total dwell time, and each hand's full timestamped
-        path -- everything a dashboard needs without re-deriving anything
-        from the raw per-frame log."""
-        # close out any dwell timers still open when the video ended/quit
-        for (handedness, symbol), start in list(self.symbol_timers.items()):
-            duration = final_timestamp_ms - start
-            if duration >= MIN_VISIT_MS:
-                entry = self.symbol_stats[symbol]
-                entry["visits"] += 1
-                entry["total_ms"] += duration
-        self.symbol_timers.clear()
+        type, pixel coordinates, status (visited / only brushed / missed),
+        >=1s visit count, total + longest dwell time and every enter/exit
+        event; the chronological order boxes were visited in; and each
+        hand's full timestamped path -- everything dashboard.py needs
+        without re-deriving anything from the raw per-frame log.
 
-        boxes_out = {}
-        for name, box_entry in self.symbol_boxes.items():
-            stats = self.symbol_stats[name]
-            boxes_out[name] = {
-                "type": stats["type"],
-                "box_px": [round(v, 1) for v in box_entry["box"]],
-                "entered": stats["entered"],
-                "missed": not stats["entered"],
-                "visits": stats["visits"],
-                "total_ms": stats["total_ms"],
-            }
+        All map coordinates are in the tracker's map space: the reference
+        PNG rotated 180 degrees (the same space label_symbols.py labels in).
+        """
+        # close out any visit still open when the video ended/quit
+        for timer in self.box_timers.values():
+            timer.close()
 
+        boxes_out = {name: t.summary() for name, t in self.box_timers.items()}
+        sequence = sorted(
+            ({"name": name, "type": t.type, **v}
+             for name, t in self.box_timers.items() for v in t.visits),
+            key=lambda e: e["enter_ms"])
+
+        frames = len(self.session_log)
+        with_hand = sum(1 for r in self.session_log
+                        if r.get("Left") or r.get("Right"))
         data = {
+            "video": os.path.basename(video_path) if video_path else None,
             "map": os.path.basename(map_path),
+            "coordinate_space": "reference PNG rotated 180 degrees",
             "ref_w": self.ref_w,
             "ref_h": self.ref_h,
+            "fps": fps,
+            "duration_ms": final_timestamp_ms,
+            "frames": frames,
+            "frames_with_hand": with_hand,
+            "min_visit_ms": MIN_VISIT_MS,
             "boxes": boxes_out,
+            "sequence": sequence,
+            "page_source": [r.get("page_source") for r in self.session_log],
             "path": {
                 "Left": self.get_path_points("Left"),
                 "Right": self.get_path_points("Right"),
@@ -384,12 +554,16 @@ class FingerDataCollector:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         print(f"Saved {path}")
-        missed = [n for n, b in boxes_out.items() if b["missed"]]
-        print(f"  {len(boxes_out) - len(missed)}/{len(boxes_out)} box(es) entered; "
-              f"missed: {missed if missed else 'none'}")
-        for name, b in sorted(boxes_out.items(), key=lambda kv: -kv[1]["total_ms"]):
-            print(f"  [{b['type']}] {name}: {b['visits']} visit(s) >=1s, "
-                  f"{b['total_ms']}ms total, entered={b['entered']}")
+        if boxes_out:
+            missed = [n for n, b in boxes_out.items() if b["missed"]]
+            visited = [n for n, b in boxes_out.items() if b["status"] == "visited"]
+            print(f"  {len(visited)}/{len(boxes_out)} box(es) visited for "
+                  f">={MIN_VISIT_MS}ms; missed entirely: "
+                  f"{missed if missed else 'none'}")
+            for name, b in sorted(boxes_out.items(),
+                                  key=lambda kv: -kv[1]["total_ms"]):
+                print(f"  [{b['type']}] {name}: {b['status']}, "
+                      f"{b['visits']} visit(s), {b['total_ms']}ms total")
         return data
 
     def close(self):
