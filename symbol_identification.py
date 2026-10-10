@@ -569,10 +569,8 @@ def restore_auto_names(previous_json, symbols):
 
 class SymbolTimer(RegionTimer):
     """A symbol's timer. Same visit rules as every other timer (see
-    timing.py); it also writes what the symbol is into the results JSON,
-    and touch_ms: all the time a finger was on it, including the touches
-    shorter than a visit that total_ms leaves out (passing through a
-    doorway rarely takes a full second).
+    timing.py: only stays of 1 s or more count); it also writes what the
+    symbol is into the results JSON.
 
     For an entrance symbol the timer is of type "entrance" and covers the
     symbol plus ENTRANCE_REACH px around it: a fingertip exploring a
@@ -591,17 +589,10 @@ class SymbolTimer(RegionTimer):
         x0, y0, x1, y1 = zone
         super().__init__(symbol["name"], kind, lambda x, y, tip: x0 <= x <= x1 and y0 <= y <= y1,
                          {"bbox": zone}, room=room)
-        self.touch_ms = 0   # all time inside, brushes included
-
-    def close(self):
-        if self._start is not None:
-            self.touch_ms += self._last_inside - self._start
-        super().close()
 
     def summary(self):
         out = super().summary()
         out["symbol"] = {k: self.symbol[k] for k in ("id", "kind", "rotation", "on_wall")}
-        out["touch_ms"] = int(self.touch_ms)
         if self.entrance:
             out["entrance_to"] = self.leads_to
             out["symbol_bbox"] = self.symbol["bbox"]
@@ -618,23 +609,6 @@ class SymbolTiming(Timing):
 
     def entrances(self):
         return [t for t in self.symbols if t.entrance]
-
-
-ENTRANCE_HEADER = ["Entrance", "Room", "Touches", "Touch Time", "Visits", "Visit Time"]
-
-
-def entrance_rows(timing, clock):
-    """The entrances table of data.csv: one row per door, in map order.
-
-    Touches / Touch Time count every time a finger was at the door, however
-    briefly. Visits / Visit Time are the same thing under timing.py's rule
-    (only stays of 1 s or more), as in the summary table. clock formats
-    milliseconds the way the other data files do (data_export.clock).
-    """
-    return [[t.name, t.room or "", len(t.visits) + t.brushes, clock(t.touch_ms),
-             len(t.visits), clock(sum(v["duration_ms"] for v in t.visits))]
-            for t in timing.entrances()]
-
 
 # ---------------------------------------------------------------- CLI
 

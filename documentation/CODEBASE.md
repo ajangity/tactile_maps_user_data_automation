@@ -216,8 +216,7 @@ On video frames the wall threshold is 40 px, since the map is smaller in the fra
 | `name_symbols`, `load_legend` | `LEGEND` maps a shape to a display name (referent + code from the user study's symbol catalogue, e.g. "Elevator P27"); a key ending in `@wall` applies to symbols on a wall; `<map>.legend.json` overrides it per map. Repeated names are numbered in reading order. |
 | `detect_symbols(trace, labels, map_path)` | The "symbols" section of `map.json`: each symbol + 6 px padding, tagged with its room. A symbol on a wall is an entrance: `entrance`, `entrance_to` (the rooms touching it, minus the corridor) and `entrance_zone` (the mark + 18 px) |
 | `restore_auto_names` | After `paper_locator` carries names over from the last run, puts back the generated name wherever the old one was never edited |
-| `SymbolTimer`, `SymbolTiming` | `timing.Timing` with symbol timers that also record `symbol` and `touch_ms` (all time inside, brushes included). Entrance symbols get type `"entrance"` and are timed over their `entrance_zone` |
-| `entrance_rows` | The entrances table of `data.csv`: per door, touches and touch time (all), visits and visit time (≥ 1 s) |
+| `SymbolTimer`, `SymbolTiming` | `timing.Timing` with symbol timers that also record `symbol`. Entrance symbols get type `"entrance"` and are timed over their `entrance_zone` |
 | CLI `main` | Prints every symbol's name, shape and match distance; saves `<map>.symbols.png` |
 
 On map E: 18 symbols (11 free-standing, 7 on walls), all recognized; correct matches score 0.0–1.0 px and the nearest wrong template ≥ 1.03 px. To add a shape, add a drawing to `TEMPLATES` and a name to `LEGEND`.
@@ -325,7 +324,7 @@ Same graph format, traced inside the crop of the frame where the map was first f
 }
 ```
 
-Symbols use `"bbox"` instead of `"polygon"`, and `"room"` is the name of the room they're in. They also carry `"symbol"` (id, kind, rotation, on_wall) and `"touch_ms"`. A symbol on a wall has `"type": "entrance"`: its `"bbox"` is the entrance zone, `"room"` and `"entrance_to"` name the room it leads into, and `"symbol_bbox"` is the mark itself. In `path`, `null` marks a gap: the hand wasn't seen, it was too far off the map, or it jumped further than a hand can move in one frame.
+Symbols use `"bbox"` instead of `"polygon"`, and `"room"` is the name of the room they're in. They also carry `"symbol"` (id, kind, rotation, on_wall). A symbol on a wall has `"type": "entrance"`: its `"bbox"` is the entrance zone, `"room"` and `"entrance_to"` name the room it leads into, and `"symbol_bbox"` is the mark itself. In `path`, `null` marks a gap: the hand wasn't seen, it was too far off the map, or it jumped further than a hand can move in one frame.
 
 ---
 

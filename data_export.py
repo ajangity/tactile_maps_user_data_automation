@@ -13,10 +13,6 @@ into the run folder next to map.json and finger_paths.png:
                                        Room Visits, Room Time, Room Dimension (inches)
                          room order  every room visit in order, revisits included:
                                        Order, Time Entered, Time Exited
-                         entrances   one row per door
-                                     (symbol_identification.entrance_rows):
-                                       Entrance, Room, Touches, Touch Time,
-                                       Visits, Visit Time
                          corners     a few times a second, how far each paper
                                      corner moved since the previous sample:
                                        Frame #, Timestamp, Corner Vectors
@@ -42,8 +38,6 @@ import os
 import shutil
 
 import numpy as np
-
-from symbol_identification import ENTRANCE_HEADER, entrance_rows
 
 CORNER_NAMES = ("TL", "TR", "BR", "BL")   # the map's own corners, as AutoCrop orders them
 CORNER_SAMPLES_PER_SECOND = 4
@@ -206,7 +200,6 @@ def save_data_files(run_dir, timing, ref, tracker, corner_motion):
     _write_csv(out("data.csv"), *side_by_side([
         (SUMMARY_HEADER, summary_rows(timing, ref.rooms, ref.inches)),
         (ORDER_HEADER, order_rows(timing, ref.rooms)),
-        (ENTRANCE_HEADER, entrance_rows(timing, clock)),
         (CORNER_HEADER, corner_motion.rows())]))
     with open(out("corner_motion.json"), "w", encoding="utf-8") as f:
         json.dump(corner_motion.to_json(), f)
