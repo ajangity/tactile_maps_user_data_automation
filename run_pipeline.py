@@ -40,7 +40,8 @@ from auto_crop import AutoCrop
 from dashboard import build_dashboard, save_dashboard_data
 from finger_tracking import FingerTracker
 from paper_locator import ReferenceMap, draw_paper_debug
-from timing import Timing, load_manual_boxes
+from symbol_identification import SymbolTiming
+from timing import load_manual_boxes
 
 DEFAULT_PLAYBACK_SPEED = 1.5   # display only; every frame is always processed
 
@@ -201,7 +202,7 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
 
     crop = AutoCrop(ref)
     tracker = FingerTracker(ref.w, ref.h)
-    timing = Timing(ref.rooms, load_manual_boxes(map_path, ref.w, ref.h))
+    timing = SymbolTiming(ref.rooms, load_manual_boxes(map_path, ref.w, ref.h))
     window = manual_crop.VideoWindow("Video Tracker", frame_w, frame_h) if display else None
     show = {"trails": False, "edges": False, "trace": False, "commands": False}
     trail_hands = {"Left": True, "Right": True}   # l / r, under t

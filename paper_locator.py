@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 
 import edge_tracing
+import symbol_identification
 from room_tracking import RoomMap, detect_rooms, detect_symbols
 
 # Step 2
@@ -87,9 +88,10 @@ class ReferenceMap:
 
         self.trace = edge_tracing.Trace(self.gray)
         label_image, rooms, gap, _ = detect_rooms(self.trace.walls)
-        symbols = detect_symbols(self.trace, label_image)
+        symbols = symbol_identification.detect_symbols(self.trace, label_image, path)
         self.json_path = json_path or os.path.splitext(path)[0] + ".map.json"
         rooms, symbols = _keep_custom_names(names_from or self.json_path, rooms, symbols)
+        symbol_identification.restore_auto_names(names_from or self.json_path, symbols)
         self.rooms = RoomMap(self.w, self.h, rooms, symbols)
         ys, xs = np.nonzero(self.trace.walls)
         x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())

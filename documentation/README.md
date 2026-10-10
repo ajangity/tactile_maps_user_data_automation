@@ -15,6 +15,7 @@ python run_pipeline.py "S-19_Elevator.mp4" distractor_floorplan_E.png
 python run_pipeline.py video.mp4 map.png --no-display      # batch mode, no window
 python dashboard.py "data/<run folder>/dashboard.json"     # rebuild a dashboard later
 python edge_tracing.py distractor_floorplan_E.png          # see what edge tracing finds
+python symbol_identification.py distractor_floorplan_E.png # see what each symbol is named
 ```
 
 Keys while the video plays: **c** shows or hides the on-screen list of commands, **Space** stops the video so you can fix the crop by hand, **t** shows trails and rooms (then **l** / **r** turn the left / right trail on and off), **e** shows the paper-edge debug view, **w** shows the edge-tracing debug view, **[ / ]** changes speed, and **q** saves and quits.
@@ -34,6 +35,7 @@ Requires `opencv-python`, `mediapipe`, `numpy`, and `hand_landmarker.task` in th
 | `manual_crop.py` | Stop the video and drag the crop's corners. Only runs when you press Space. |
 | `finger_tracking.py` | Steps 22–24: MediaPipe, mapping fingertips onto the map, and keeping Left/Right straight. |
 | `room_tracking.py` | Works out exactly which PNG pixels belong to each room, and which room each symbol is in. |
+| `symbol_identification.py` | Finds every symbol (including ones drawn on a wall), recognizes its shape, and names it: "Stairs zigzag", "Elevator E 2", "Door P6 1". Run it on a map PNG to check the names. |
 | `timing.py` | Enter/exit timers: one for the paper, one per room, one per symbol. |
 | `dashboard.py` | Saves the results JSON and builds the HTML dashboard. |
 | `label_symbols.py` | Optional. Draws extra boxes by hand, each of which gets a timer too. |
@@ -64,7 +66,7 @@ All map coordinates are the PNG's own pixels, in the PNG's own orientation.
 
 ## The pipeline
 
-1. Loads the tactile map PNG. **It's no longer rotated 180 degrees.** The orientation is now worked out from the video itself (step 4), so we don't need to assume how the paper sits. Edge tracing reads every black line on the PNG and saves them as a graph in `map.json`: nodes are line ends, corners and T-junctions, and edges are the lines between them. Room tracking then works out the rooms. It thickens the walls just enough to seal the doorways, so each room becomes a sealed white area. Then it grows each room back out to the real walls, so every pixel inside the map belongs to exactly one room. It finds the right doorway width by itself, by testing a range of widths and keeping the one where the room count stays stable. On map E that's 11 rooms (10 rooms plus the corridor). Every symbol is tagged with the room it's in.
+1. Loads the tactile map PNG. **It's no longer rotated 180 degrees.** The orientation is now worked out from the video itself (step 4), so we don't need to assume how the paper sits. Edge tracing reads every black line on the PNG and saves them as a graph in `map.json`: nodes are line ends, corners and T-junctions, and edges are the lines between them. Room tracking then works out the rooms. It thickens the walls just enough to seal the doorways, so each room becomes a sealed white area. Then it grows each room back out to the real walls, so every pixel inside the map belongs to exactly one room. It finds the right doorway width by itself, by testing a range of widths and keeping the one where the room count stays stable. On map E that's 11 rooms (10 rooms plus the corridor). Every symbol is tagged with the room it's in. Symbol identification then names each symbol by its shape. It compares the symbol with a small library of drawn templates (stairs, E, star, plus, circle, ...) at all four rotations, and a legend turns the shape into a name: the referent it stands for plus its code in the user study's symbol catalogue, such as "Elevator P27", "Toilet P9" or "Door P6". Orientation counts where the catalogue says so: a square missing its top side is a toilet (P26), missing its right side an elevator (P27). If a name occurs more than once it's numbered ("Elevator E 1", "Elevator E 2"). Symbols drawn on a wall are found too, by erasing the straight wall lines and keeping what's left. To change what a shape is called on one map, put a `<map>.legend.json` next to the PNG, e.g. `{"star": "Emergency exit"}`.
 2. Using Otsu's method, the script splits bright pixels (paper) from darker ones (table, hands, etc.). It also throws out bright pixels that are too colorful, since skin can be nearly as bright as paper but is more saturated. That stops a hand resting between two papers from joining them into one blob.
 3. *(First frame, and when lost.)* The script makes rough 4-corner outlines to start from, in two independent ways:
    - **Paper edges:** each big white blob, with its corners fitted the same way as steps 8–12.
@@ -116,7 +118,8 @@ All map coordinates are the PNG's own pixels, in the PNG's own orientation.
 22. The script crops around the paper plus some margin, enlarges the crop up to 2.5×, and runs MediaPipe for the index fingertip of up to 2 hands.
 23. The fingertip goes crop → frame → PNG pixels, through a homography built fresh every frame from that frame's corners. It's marked `on_paper` if it lands on the map. The trail breaks instead of drawing a straight line across any jump over 140 px.
 24. Each hand is matched to whichever hand's wrist was closest last frame, solving both hands together. Then it's labeled Left/Right from a short, fading memory of MediaPipe's own Left/Right calls, weighted by MediaPipe's confidence. One low-confidence frame can't swap the labels, and a wrong label can't stick (MediaPipe's labels are reliable for a camera across the table).
-25. **Timers** (`timing.py`): one for the paper, one per room, and one per symbol (plus any boxes drawn with `label_symbols.py`). Every timer works the same way:
+25. **Timers** (`timing.py`, plus `symbol_identification.SymbolTiming` for the symbols): one for the paper, one per room, and one per symbol (plus any boxes drawn with `label_symbols.py`). Every timer works the same way:
+    - **Entrances:** a symbol drawn on a wall marks a room's entrance, so its timer is an *entrance* timer. It covers the mark plus a little space around it, and records which room the entrance leads into.
     - **Start:** a finger enters the room's exact pixels.
     - **End:** no finger has been in it for 0.4 s, either because it left or because the hand vanished. The visit ends at the last moment a finger was actually inside.
     - **Two hands at once:** still one visit.

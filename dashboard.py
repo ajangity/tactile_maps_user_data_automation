@@ -434,7 +434,8 @@ ol.seq li b { color: var(--ink); font-weight: 600; }
   }
   const hideTip = () => { tip.style.display = "none"; };
   const typeText = (b) => b.type === "room" ? "Room" :
-    b.type === "symbol" ? "Symbol" + (b.room ? " in " + b.room : "") : b.type;
+    b.type === "symbol" ? "Symbol" + (b.room ? " in " + b.room : "") :
+    b.type === "entrance" ? "Entrance" + (b.room ? " to " + b.room : "") : b.type;
   const boxLines = (b) => [
     esc(typeText(b)) + " · " + STATUS[b.status].label,
     b.visits + " visit" + (b.visits === 1 ? "" : "s") + " · " + secs(b.total_ms) + " total",
@@ -540,7 +541,7 @@ ol.seq li b { color: var(--ink); font-weight: 600; }
   });
 
   // ---------- table ----------
-  const order = { room: 0, symbol: 1 };
+  const order = { room: 0, symbol: 1, entrance: 2 };
   const sorted = [...D.boxes].sort((a, b) =>
     (order[a.type] - order[b.type]) || a.name.localeCompare(b.name, undefined, { numeric: true }));
   const legendCounts = { visited: 0, brushed: 0, missed: 0 };
