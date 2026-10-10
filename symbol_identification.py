@@ -13,7 +13,9 @@ How a symbol gets its name, in three steps:
      connected to the wall network and so count as "wall". find_wall_symbols
      recovers them: erase every long straight run of the walls, and whatever
      ink is left over is a symbol. Small hollow rings (which edge tracing
-     files under "dots") are picked up too.
+     files under "dots") are picked up too. Doorways are found as well
+     (find_wall_gaps): a short break along a wall line. A break and the wall
+     symbols beside it are one door; a break with no symbol is a door too.
 
   2. RECOGNIZE THE SHAPE. Each symbol's ink is scaled into a 48x48 box and
      thinned to 1 px centre lines, then compared with a small library of
@@ -71,6 +73,11 @@ WALL_SYMBOL_MIN = 10      # px; smaller leftovers are corner/junction crumbs
 WALL_SYMBOL_MAX = 80      # px; bigger leftovers are diagonal walls / hatching, not a symbol
 GROUP_GAP = 9             # px; leftover pieces this close together are one symbol
 
+# ---- finding doorways (gaps in a wall)
+DOOR_GAP_MIN = 10         # px; a shorter break in a wall is a print flaw, not a doorway
+DOOR_GAP_MAX = 70         # px; a longer break is two separate walls
+DOOR_JOIN = 20            # px; wall symbols this close to a gap belong to that doorway
+
 # ---- timing
 SYMBOL_PADDING = 6        # px added around each symbol's box for its timer
 ENTRANCE_REACH = 18       # px around an entrance symbol that count as "at the entrance"
@@ -105,6 +112,13 @@ LEGEND = {
     "four-rings": "Emergency exit P99",     # four small circles in a diamond
     "ring-line": "Emergency exit P48",      # circle with a line through its centre
     "ring-line@wall": "Door P6",            # ... unless that line is the wall it sits on
+    # Everything on a wall is a door: on the study's maps each room has
+    # exactly one entrance, drawn as one of the door candidates below.
+    "gap": "Door gap",                      # a plain gap in the wall
+    "four-rings@wall": "Door 4 dots",       # four small circles around a gap
+    "bullseye@wall": "Door double circle",
+    "B-rotated@wall": "Door B",
+    "B@wall": "Door B",
     "ring": "Door P6",
     "T": "Door P95",
     "bar@wall": "Door P95",                 # the T's bar crossing a wall
@@ -161,6 +175,61 @@ def find_wall_symbols(trace):
             keep[y0:y1 + 1, x0:x1 + 1] = (walls | rings)[y0:y1 + 1, x0:x1 + 1]
             boxes.append((x0, y0, x1, y1))
     return keep, boxes
+
+
+def find_wall_gaps(trace):
+    """Doorways: boxes (x0, y0, x1, y1) of the breaks along each wall line.
+
+    Every long straight run of wall belongs to a wall line (runs at the same
+    x, or the same y, are one line). Walking along a line, a stretch with no
+    ink between DOOR_GAP_MIN and DOOR_GAP_MAX px long is a doorway. A symbol
+    sitting in the doorway (four circles, a double circle) doesn't hide it:
+    only ink on the line itself counts.
+    """
+    walls = trace.walls
+    gaps = []
+    for vertical in (True, False):
+        kernel = np.ones((WALL_RUN_MIN, 1) if vertical else (1, WALL_RUN_MIN), np.uint8)
+        n, _, stats, _ = cv2.connectedComponentsWithStats(cv2.morphologyEx(walls, cv2.MORPH_OPEN, kernel))
+        runs = sorted((x + w / 2.0, y, y + h) if vertical else (y + h / 2.0, x, x + w)
+                      for x, y, w, h, _ in stats[1:])
+        lines = []   # [position across, start along, end along]
+        for across, start, end in runs:
+            if lines and abs(lines[-1][0] - across) <= 3:
+                lines[-1][1:] = [min(lines[-1][1], start), max(lines[-1][2], end)]
+            else:
+                lines.append([across, start, end])
+        for across, start, end in lines:
+            c, start, end = int(round(across)), int(start), int(end)
+            band = walls[start:end, max(0, c - 3):c + 4] if vertical else walls[max(0, c - 3):c + 4, start:end]
+            empty = np.flatnonzero(band.max(axis=1 if vertical else 0) == 0)
+            if len(empty) == 0:
+                continue
+            for stretch in np.split(empty, np.flatnonzero(np.diff(empty) > 1) + 1):
+                if DOOR_GAP_MIN <= len(stretch) <= DOOR_GAP_MAX:
+                    a, b = int(stretch[0]) + start, int(stretch[-1]) + start
+                    gaps.append((c - 3, a, c + 3, b) if vertical else (a, c - 3, b, c + 3))
+    return gaps
+
+
+def merge_doorways(symbols, gaps):
+    """One entry per doorway. A gap and the wall symbols within DOOR_JOIN px
+    of it are the same door (the two ticks either side of a gap, the four
+    circles around one), so they become a single symbol covering all of
+    them. A gap with no symbol is a door of kind "gap"."""
+    symbols = list(symbols)
+    for gap in gaps:
+        reach = (gap[0] - DOOR_JOIN, gap[1] - DOOR_JOIN, gap[2] + DOOR_JOIN, gap[3] + DOOR_JOIN)
+        parts = [s for s in symbols if s["on_wall"] and _overlap(s["box"], reach)]
+        boxes = [s["box"] for s in parts] + [gap]
+        door = {"kind": parts[0]["kind"] if parts else "gap",
+                "rotation": parts[0]["rotation"] if parts else 0,
+                "match": max((s["match"] for s in parts), default=0.0),
+                "on_wall": True, "gap": gap,
+                "box": (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                        max(b[2] for b in boxes), max(b[3] for b in boxes))}
+        symbols = [s for s in symbols if not any(s is part for part in parts)] + [door]
+    return symbols
 
 
 def _overlap(a, b):
@@ -402,14 +471,17 @@ def identify_symbols(trace, map_path=None):
     """Every symbol on the map, found, recognized and named.
 
     Returns dicts with kind, name, rotation, match (chamfer distance; lower
-    is surer), on_wall and box (x0, y0, x1, y1), in reading order.
+    is surer), on_wall and box (x0, y0, x1, y1), in reading order. A doorway
+    also has gap, the box of its break in the wall, when it has one.
     """
     ink, found = find_symbols(trace)
     symbols = []
-    for box, on_wall in sorted(found, key=lambda f: (f[0][1] // 40, f[0][0])):
+    for box, on_wall in found:
         kind, rotation, distance = recognize(ink, box)
         symbols.append({"kind": kind, "rotation": rotation, "match": round(distance, 2),
                         "on_wall": on_wall, "box": box})
+    symbols = merge_doorways(symbols, find_wall_gaps(trace))
+    symbols.sort(key=lambda s: (s["box"][1] // 40, s["box"][0]))
     return name_symbols(symbols, load_legend(map_path))
 
 
@@ -464,6 +536,8 @@ def detect_symbols(trace, label_image, map_path=None):
             symbol["entrance"] = True
             symbol["entrance_to"] = [i for i in rooms if i != corridor] or rooms
             symbol["entrance_zone"] = [max(0, x0 - r), max(0, y0 - r), min(w - 1, x1 + r), min(h - 1, y1 + r)]
+            if found.get("gap"):
+                symbol["gap"] = list(found["gap"])
         symbols.append(symbol)
     return symbols
 
@@ -544,6 +618,22 @@ class SymbolTiming(Timing):
 
     def entrances(self):
         return [t for t in self.symbols if t.entrance]
+
+
+ENTRANCE_HEADER = ["Entrance", "Room", "Touches", "Touch Time", "Visits", "Visit Time"]
+
+
+def entrance_rows(timing, clock):
+    """The entrances table of data.csv: one row per door, in map order.
+
+    Touches / Touch Time count every time a finger was at the door, however
+    briefly. Visits / Visit Time are the same thing under timing.py's rule
+    (only stays of 1 s or more), as in the summary table. clock formats
+    milliseconds the way the other data files do (data_export.clock).
+    """
+    return [[t.name, t.room or "", len(t.visits) + t.brushes, clock(t.touch_ms),
+             len(t.visits), clock(sum(v["duration_ms"] for v in t.visits))]
+            for t in timing.entrances()]
 
 
 # ---------------------------------------------------------------- CLI

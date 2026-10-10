@@ -3,16 +3,24 @@
 Written at the end of every run (run_pipeline.py calls save_data_files),
 into the run folder next to map.json and finger_paths.png:
 
-  summary.csv          one row per room (labeled by the symbol in it), then
-                       one per symbol not used as a label, plus the whole map:
-                         Element/Symbol, Symbol Visits, Symbol Time,
-                         Room Visits, Room Time, Room Dimension (inches)
-  room_order.csv       every room visit in order, revisits included:
-                         Order, Time Entered, Time Exited
-  corner_motion.csv    a few times a second, how far each paper corner moved
-                       since the previous sample:
-                         Frame #, Timestamp, Corner Vectors
-  corner_motion.json   the same vectors, one list per corner: {"TL": [[dx, dy], ...], ...}
+  data.csv             every table of the run in one sheet, side by side
+                       with an empty column between them (laid out like the
+                       team's spreadsheet), each starting at the top row:
+                         summary     one row per room (labeled by the symbol
+                                     in it), then one per symbol not used as
+                                     a label, plus the whole map:
+                                       Element/Symbol, Symbol Visits, Symbol Time,
+                                       Room Visits, Room Time, Room Dimension (inches)
+                         room order  every room visit in order, revisits included:
+                                       Order, Time Entered, Time Exited
+                         entrances   one row per door
+                                     (symbol_identification.entrance_rows):
+                                       Entrance, Room, Touches, Touch Time,
+                                       Visits, Visit Time
+                         corners     a few times a second, how far each paper
+                                     corner moved since the previous sample:
+                                       Frame #, Timestamp, Corner Vectors
+  corner_motion.json   the corner vectors, one list per corner: {"TL": [[dx, dy], ...], ...}
   finger_positions.json  every frame's index fingertips in map (PNG) pixels
   floorplan.png        a copy of the map PNG the run used
 
@@ -34,6 +42,8 @@ import os
 import shutil
 
 import numpy as np
+
+from symbol_identification import ENTRANCE_HEADER, entrance_rows
 
 CORNER_NAMES = ("TL", "TR", "BR", "BL")   # the map's own corners, as AutoCrop orders them
 CORNER_SAMPLES_PER_SECOND = 4
@@ -75,7 +85,7 @@ class CornerMotion:
 
     def to_json(self):
         """{corner name: [[dx, dy] or None per sample]} -- one list per corner,
-        lined up with the rows of corner_motion.csv."""
+        lined up with the corner rows of data.csv."""
         return {name: [None if s["vectors"] is None else list(s["vectors"][i]) for s in self.samples]
                 for i, name in enumerate(CORNER_NAMES)}
 
@@ -156,6 +166,24 @@ ORDER_HEADER = ["Order", "Time Entered", "Time Exited"]
 CORNER_HEADER = ["Frame #", "Timestamp", "Corner Vectors"]
 
 
+def side_by_side(tables):
+    """[(header, rows), ...] -> (header, rows) of one sheet: the tables next
+    to each other with an empty column between, shorter ones padded with
+    empty cells."""
+    header, widths = [], []
+    for k, (table_header, _) in enumerate(tables):
+        header += ([""] if k else []) + list(table_header)
+        widths.append(len(table_header))
+    rows = []
+    for i in range(max(len(table_rows) for _, table_rows in tables)):
+        row = []
+        for k, (_, table_rows) in enumerate(tables):
+            cells = list(table_rows[i]) if i < len(table_rows) else []
+            row += ([""] if k else []) + cells + [""] * (widths[k] - len(cells))
+        rows.append(row)
+    return header, rows
+
+
 def _write_csv(path, header, rows):
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -175,9 +203,11 @@ def save_data_files(run_dir, timing, ref, tracker, corner_motion):
     """Write every file listed in the module notes into run_dir. Call after
     timing.finish()."""
     out = lambda name: os.path.join(run_dir, name)
-    _write_csv(out("summary.csv"), SUMMARY_HEADER, summary_rows(timing, ref.rooms, ref.inches))
-    _write_csv(out("room_order.csv"), ORDER_HEADER, order_rows(timing, ref.rooms))
-    _write_csv(out("corner_motion.csv"), CORNER_HEADER, corner_motion.rows())
+    _write_csv(out("data.csv"), *side_by_side([
+        (SUMMARY_HEADER, summary_rows(timing, ref.rooms, ref.inches)),
+        (ORDER_HEADER, order_rows(timing, ref.rooms)),
+        (ENTRANCE_HEADER, entrance_rows(timing, clock)),
+        (CORNER_HEADER, corner_motion.rows())]))
     with open(out("corner_motion.json"), "w", encoding="utf-8") as f:
         json.dump(corner_motion.to_json(), f)
     with open(out("finger_positions.json"), "w", encoding="utf-8") as f:

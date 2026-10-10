@@ -175,7 +175,7 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
         floorplan.png          the floor plan PNG
         finger_paths.png       left (red) / right (blue) trails on the map
         finger_positions.json  every frame's index fingertips in map pixels
-        summary.csv, room_order.csv, corner_motion.csv, corner_motion.json
+        data.csv, corner_motion.json
                                (see data_export.py)
     """
     run_dir = make_run_dir(map_path, video_path, data_dir)
