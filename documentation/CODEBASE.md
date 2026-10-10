@@ -14,7 +14,7 @@ Given a **video** of someone exploring a printed tactile map and the map's **flo
 1. Finds the printed map in each video frame, even when it's rotated, tilted in perspective, moved, partly covered by hands, or next to a decoy sheet. This is the **crop**: the map's 4 corners in the frame.
 2. Tracks the index fingertip of up to two hands with MediaPipe, and maps each fingertip onto the PNG's own pixel coordinates.
 3. Works out the map's rooms and symbols automatically from the PNG. It then times every visit to the paper, each room and each symbol; a visit counts if it lasts at least 1 second.
-4. Saves everything into a per-run folder, including an interactive HTML dashboard.
+4. Saves the data files (3 CSVs, corner-motion JSON, map JSON, floorplan PNG, finger-path PNG and JSON) into a per-run folder.
 
 ---
 
@@ -33,7 +33,6 @@ python label_symbols.py distractor_floorplan_E.png                              
 | Option | Meaning |
 |---|---|
 | `--no-display` | No window; runs start to finish unattended. |
-| `--no-open` | Don't open the dashboard when finished. |
 | `--data-dir PATH` | Where run folders are created. Default: `data/` next to the code. |
 
 **Keys while the video plays**
@@ -92,20 +91,20 @@ The pipeline runs in 8 layers, top to bottom. Layers 4–6 repeat for every vide
                          │
 3 Know the map    paper_locator.ReferenceMap ◄── edge_tracing (PNG lines → graph)
   (once)                 │              ◄── room_tracking (rooms, symbols)
-                         └─► map.json, rooms.png
+                         └─► map.json
    ┌──────────────── every frame ────────────────────────────────────────┐
 4  │ auto_crop.py ─ calls ─► edge_tracing (ink inside crop + 35%)        │
    │      │                  paper_locator (steps 2–8, scoring rubric)   │
    │      │                  corner_fitting (steps 9–17, ICP, shift)     │
    │      │                  crop_checker (14, 18, 19, 21)               │
-   │      │ ◄── manual_crop.py (Space)          └─► frame_lines.json     │
+   │      │ ◄── manual_crop.py (Space)                                   │
    │      ▼ 4 corners                                                    │
 5  │ finger_tracking.py ◄── hand_landmarker.task ─► session log, trails  │
    │      ▼ fingertips (PNG px, on_paper)                                │
 6  │ timing.py ◄── RoomMap (room pixels, symbol boxes), extra boxes      │
    └─────────────────────────────────────────────────────────────────────┘
-7 Results         dashboard.py ─► dashboard.json, dashboard.html
-8 Run folder      all 7 files in data/<date_time>__<map>__<video>/
+7 Results         data_export.py ─► summary.csv, room_order.csv, corner_motion.csv/.json, ...
+8 Run folder      all 8 files in data/<date_time>__<map>__<video>/
 ```
 
 **Dependency rules**
@@ -120,11 +119,11 @@ The pipeline runs in 8 layers, top to bottom. Layers 4–6 repeat for every vide
 
 ### `run_pipeline.py`: entry point
 
-Creates the run folder and builds the `ReferenceMap`, which writes `map.json`; it also saves `rooms.png`. It then loops over frames: `AutoCrop.update` → `FingerTracker.update` → `Timing.step`. In display mode it draws the crop, the overlays and a status bar. At the end it writes all outputs and opens the dashboard.
+Creates the run folder and builds the `ReferenceMap`, which writes `map.json`. It then loops over frames: `AutoCrop.update` → `FingerTracker.update` → `Timing.step`. In display mode it draws the crop, the overlays and a status bar. At the end it writes the 8 output files (`data_export.save_data_files` plus `finger_paths.png`).
 
 | Function | Purpose |
 |---|---|
-| `run(video, map, data_dir, display, open_dashboard)` | Whole run; returns the run folder |
+| `run(video, map, data_dir, display)` | Whole run; returns the run folder |
 | `make_run_dir`, `previous_map_json` | Run folder naming; carry hand-edited names over from the last run of the same map |
 | `draw_crop`, `draw_regions`, `banner` | Live-window drawing |
 
@@ -176,10 +175,10 @@ Step 11 was removed: it reused a side's line from an earlier frame when that sid
 3. If A scores below 0.60, add **candidates B**: each blob's `fit_quad`, or the ink-border fallback if no blob works, then snap and ICP.
 4. Every candidate goes through `check_quad` + `judge` (outline check, then the rubric). The best one scoring ≥ 0.40 wins; then `keep_if_stationary`, then `smooth`.
 5. **Nothing passed:** every 3 frames, `_realign` (shift search + ICP); then the PNG backup; then the flow backup; otherwise hold the crop.
-6. After 20 unconfirmed frames the crop is **lost**: a whole-frame `locate` runs every 3 frames, and results within 85% of the best count as a tie (the one nearest the last crop wins).
+6. After 20 unconfirmed frames the map has **left the frame**: `_unlock` drops the crop (`corners = None`) and the next frames take branch 1 again, exactly as at the start of the video.
 7. `correct_outlier_corner`, then `corner_visible`.
 
-**Source labels** (logged per frame): `searching`, `found`, `lines` (candidate A), `edges` (candidate B), `realigned`, `PNG`, `flow`, `held`, `lost`, `recovered`, `manual`.
+**Source labels** (logged per frame): `searching`, `found`, `lines` (candidate A), `edges` (candidate B), `realigned`, `PNG`, `flow`, `held`, `manual`. (`lost` / `recovered` appear only in runs from before the map-left-the-frame change.)
 
 ### `edge_tracing.py`: line tracing
 
@@ -190,7 +189,7 @@ Step 11 was removed: it reused a side's line from an earlier frame when that sid
 | `trace_segments`, `merge_segments` | Hough on walls; merge segments within 3°, 4 px offset and 8 px gap |
 | `build_line_graph` | Nodes at line ends, corners and T-junctions (8 px tolerance); edges with length and angle |
 | `Trace(gray, region=…)` | All of the above; `symbol_marks()`, `to_json()` |
-| `load_image`, `classify_shape`, `draw_trace` | Transparent PNGs onto white; shape labels; the `w` overlay |
+| `load_image`, `classify_shape`, `draw_trace` | Transparent PNGs onto white; rough shape labels (room_tracking's legacy symbols only); the `w` overlay (symbols boxed, unnamed: names come from symbol_identification) |
 | CLI `main` | `<name>.lines.json` + `.lines.png` + a per-symbol listing |
 
 On video frames the wall threshold is 40 px, since the map is smaller in the frame than in the PNG.
@@ -233,13 +232,13 @@ On map E: 18 symbols (11 free-standing, 7 on walls), all recognized; correct mat
 
 | Item | Detail |
 |---|---|
-| Timers | `On paper`; one per room (`RoomMap.room_at`); one per symbol (bbox); one per extra box |
-| Visit rules | Starts when any fingertip is inside. Ends after 0.4 s with none inside, at the last moment one was inside. Two hands count as one visit. ≥ 1 s = visit, shorter = brush. |
+| Timers | `On paper` (`InteractionTimer`: runs while any fingertip is on the map, pauses the first frame none is; no grace, no minimum); one per room (`RoomMap.room_at`); one per symbol (bbox); one per extra box |
+| Visit rules (rooms, symbols) | Starts when any fingertip is inside. Ends after 0.4 s with none inside, at the last moment one was inside. Two hands count as one visit. ≥ 1 s = visit, shorter = brush. |
 | Status | `visited` (≥ 1 visit), `brushed` (touched, no visit), `missed` (never touched) |
 | `sequence()` | Every visit in time order: the path through the rooms |
 | `load_manual_boxes` | Reads `<map>.symbols.json`; files without `"space": "png"` are rotated back from the old 180° convention |
 
-### `dashboard.py`: step 26
+### `dashboard.py`: not called by a run (rebuilds dashboards from older runs' `dashboard.json`)
 
 | Function | What it does |
 |---|---|
@@ -288,11 +287,11 @@ All map coordinates are the **PNG's own pixels, in the PNG's own orientation** (
 
 Renaming a room or symbol here carries over to the next run of the same map; names are matched by id. A symbol name that was never edited (`name` equals `auto_name`) is regenerated instead.
 
-### `frame_lines.json`
+### `frame_lines.json` (no longer written by a run)
 
 Same graph format, traced inside the crop of the frame where the map was first found. Each node also has `map_x`/`map_y`, so it can be compared with `map.json` directly. Extra fields: `frame_index`, `crop` (4 corners), and `alignment` (the score breakdown, per class: precision, recall, F).
 
-### `session.json` (one record per frame)
+### `session.json` (one record per frame; no longer written to disk, kept in memory as `FingerTracker.session_log`)
 
 ```jsonc
 {"frame": 631, "t_ms": 21054, "page_source": "lines", "page_score": 0.94,
@@ -302,7 +301,7 @@ Same graph format, traced inside the crop of the frame where the map was first f
  "Right": null}
 ```
 
-### `dashboard.json`
+### `dashboard.json` (no longer written by a run)
 
 ```jsonc
 {
@@ -395,7 +394,9 @@ On map E this finds 11 rooms (10 rooms + the corridor). The sealing width it pic
 | `TRACK_SCORE` | auto_crop | 0.40 | Per-frame acceptance |
 | `STRONG_SCORE` | auto_crop | 0.60 | Above this, skip paper-edge candidates (~75 ms saved) |
 | `SEARCH_EVERY` | auto_crop | 10 | Frames between searches before first lock |
-| `MAX_UNCONFIRMED` | auto_crop | 20 | Frames before "lost" |
+| `MAX_UNCONFIRMED` | auto_crop | 20 | Unconfirmed frames before the map counts as gone and the search restarts |
+| `CORNER_SAMPLES_PER_SECOND` | data_export | 4 | Corner-motion samples per second |
+| `PAGE_INCHES` | units | 8.5 × 11 | Physical sheet size for pixel → inch conversion |
 | `SEARCH_MARGIN` | paper_locator | 0.35 | Crop growth for the search window and tracing region (20% tested: 3× worse) |
 | `SCORE_TOLERANCE` | paper_locator | 5 px | Rubric match distance |
 | `PAPER_SAT_MAX` | paper_locator | 55 | Skin rejection ceiling |

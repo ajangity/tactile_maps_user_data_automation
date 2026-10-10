@@ -34,6 +34,7 @@ import numpy as np
 import edge_tracing
 import symbol_identification
 from room_tracking import RoomMap, detect_rooms, detect_symbols
+from units import PixelsToInches
 
 # Step 2
 PAPER_SAT_MAX = 55        # HSV saturation ceiling for "paper"; skin measured ~28-41+
@@ -92,6 +93,9 @@ class ReferenceMap:
         self.json_path = json_path or os.path.splitext(path)[0] + ".map.json"
         rooms, symbols = _keep_custom_names(names_from or self.json_path, rooms, symbols)
         symbol_identification.restore_auto_names(names_from or self.json_path, symbols)
+        self.inches = PixelsToInches(self.w, self.h)
+        for room in rooms:   # (width, height) of the room's bounding box on the paper
+            room["size_in"] = list(self.inches.bbox_size(room["bbox"]))
         self.rooms = RoomMap(self.w, self.h, rooms, symbols)
         ys, xs = np.nonzero(self.trace.walls)
         x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
@@ -102,6 +106,7 @@ class ReferenceMap:
             image=os.path.basename(path),
             border=self.border.tolist(),
             room_gap_px=int(gap),
+            **self.inches.to_json(),
             rooms=rooms,
             symbols=symbols,
         )

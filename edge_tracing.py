@@ -312,18 +312,16 @@ def classify_shape(mask, box):
 def draw_trace(canvas, trace, label=True):
     """Draw what edge tracing found onto canvas (same size as the traced
     image): wall pixels, each straight wall line (red), graph nodes
-    (yellow), dots (green), and each symbol boxed in blue with its index
-    and shape ("3:circle"), plus the totals."""
+    (yellow), dots (green), and each symbol boxed in blue, plus the totals.
+    Symbols aren't named here: symbol_identification.py names them, from
+    the map PNG's JSON."""
     canvas[trace.walls > 0] = (0, 0, 160)
     canvas[trace.classes == CLASS_DOT] = (0, 160, 0)
     for x1, y1, x2, y2 in trace.segments:
         cv2.line(canvas, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2, cv2.LINE_AA)
     symbols = trace.symbol_marks()
-    for i, box in enumerate(symbols):
-        x0, y0, x1, y1 = box
+    for x0, y0, x1, y1 in symbols:
         cv2.rectangle(canvas, (x0, y0), (x1, y1), (255, 0, 0), 2)
-        cv2.putText(canvas, f"{i}:{classify_shape(trace.ink, box)}", (x0, max(10, y0 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1, cv2.LINE_AA)
     if trace.graph:
         for n in trace.graph["nodes"]:
             cv2.circle(canvas, (int(n["x"]), int(n["y"])), 4, (0, 220, 255), -1)
@@ -366,8 +364,7 @@ def main():
     symbols = trace.symbol_marks()
     print(f"{len(g['edges'])} wall lines, {len(g['nodes'])} nodes, {len(symbols)} symbol marks")
     for i, (x0, y0, x1, y1) in enumerate(symbols):
-        print(f"  symbol {i}: center=({(x0 + x1) // 2},{(y0 + y1) // 2}) "
-              f"size={x1 - x0}x{y1 - y0} shape='{classify_shape(trace.ink, (x0, y0, x1, y1))}'")
+        print(f"  symbol {i}: center=({(x0 + x1) // 2},{(y0 + y1) // 2}) size={x1 - x0}x{y1 - y0}")
     print(f"saved {prefix}.lines.json and {prefix}.lines.png")
 
 

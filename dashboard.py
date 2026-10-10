@@ -403,7 +403,7 @@ ol.seq li b { color: var(--ink); font-weight: 600; }
   const tiles = [
     ["Session length", fmt(D.duration_ms), D.frames ? D.frames + " frames" : ""],
     ["Time on paper", D.paper ? secs(D.paper.total_ms) : "—",
-      D.paper ? D.paper.visits + " touch" + (D.paper.visits === 1 ? "" : "es") + " ≥ " + secs(D.min_visit_ms) : ""],
+      D.paper ? "a finger on the map; " + D.paper.visits + " stretch" + (D.paper.visits === 1 ? "" : "es") : ""],
     ["Rooms visited", rooms.length ? visited(rooms) + " / " + rooms.length : "—",
       rooms.length ? "" : "no rooms found"],
     ["Symbols visited", symbols.length ? visited(symbols) + " / " + symbols.length : "—",

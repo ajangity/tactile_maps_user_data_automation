@@ -1,14 +1,14 @@
 """Timing: one enter/exit timer per region the user's finger can be in.
 
 Timers are created for:
-  - the paper itself  ("On paper": every time a fingertip lands on the
-                       map's pixels, and every time it leaves)
+  - the paper itself  ("On paper", the main timer: the total time the user
+                       interacts with the map -- see InteractionTimer)
   - every room        (from the map JSON's rooms -- the exact pixels
                        room_tracking.py assigned to each room)
   - every symbol      (from the map JSON's symbols -- hover time)
   - any boxes drawn by hand with label_symbols.py (optional extras)
 
-Every timer works the same way (RegionTimer):
+Every room / symbol timer works the same way (RegionTimer):
   - a visit starts the first frame any fingertip is inside the region
   - it ends once no fingertip has been inside for EXIT_GRACE_MS (MediaPipe
     drops a hand for a few frames at a time; a lifted hand also ends it),
@@ -83,6 +83,49 @@ class RegionTimer:
         }
 
 
+class InteractionTimer(RegionTimer):
+    """The main timer: total time the user interacts with the map.
+
+    A stopwatch with no grace period and no minimum: it runs on every frame
+    at least one index fingertip is inside the map's pixels, and pauses on
+    the first frame none is (hands lifted, off the paper, or the map not in
+    the frame at all). Each run from start to pause is one "visit", and
+    total_ms is their sum.
+    """
+
+    def __init__(self, width, height):
+        super().__init__("On paper", "paper", lambda x, y, tip: tip["on_paper"],
+                         {"bbox": [0, 0, width - 1, height - 1]})
+        self.now_ms = 0
+
+    @property
+    def running(self):
+        return self._start is not None
+
+    def elapsed_ms(self):
+        """Total so far, including the run in progress."""
+        done = sum(v["duration_ms"] for v in self.visits)
+        return done + (self.now_ms - self._start if self.running else 0)
+
+    def step(self, hands_inside, timestamp_ms):
+        self.now_ms = timestamp_ms
+        if hands_inside:
+            if self._start is None:
+                self._start, self._hands = timestamp_ms, set()
+            self._hands |= hands_inside
+        elif self._start is not None:
+            self.close()   # paused as of this frame
+
+    def close(self):
+        if self._start is None:
+            return
+        if self.now_ms > self._start:
+            self.visits.append({"enter_ms": self._start, "exit_ms": self.now_ms,
+                                "duration_ms": self.now_ms - self._start,
+                                "hands": sorted(self._hands)})
+        self._start = None
+
+
 def _in_bbox(bbox):
     x0, y0, x1, y1 = bbox
     return lambda x, y, tip: x0 <= x <= x1 and y0 <= y <= y1
@@ -116,8 +159,7 @@ class Timing:
     def __init__(self, room_map, manual_boxes=None):
         self.room_map = room_map
         w, h = room_map.width, room_map.height
-        self.paper = RegionTimer("On paper", "paper", lambda x, y, tip: tip["on_paper"],
-                                 {"bbox": [0, 0, w - 1, h - 1]})
+        self.paper = InteractionTimer(w, h)
         self.rooms = {}
         for r in room_map.rooms:
             rid = r["id"]

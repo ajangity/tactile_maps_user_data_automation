@@ -1,0 +1,21 @@
+Element/Symbol,Symbol Visits,Symbol Time,Room Visits,Room Time,Room Dimension (in)
+Entire map,,,,1:14.41,"(8.5, 11)"
+Stairs zigzag (Room 1),2,0:02.97,2,0:07.27,"(2.17, 1.36)"
+Toilet P26 (Room 2),0,0:00.00,1,0:02.04,"(2.15, 1.38)"
+Elevator E 1 (Room 3),4,0:12.28,6,0:22.65,"(2.17, 1.34)"
+Elevator E 2 (Room 4),4,0:05.81,4,0:12.11,"(2.17, 3.03)"
+Elevator P27 (Room 5),3,0:12.55,6,0:23.09,"(2.15, 2.17)"
+Room 6,,,4,0:05.37,"(2.99, 10.03)"
+Dangerous area P10 (Room 7),1,0:01.53,2,0:04.71,"(2.15, 1.35)"
+Reception P41 (Room 8),0,0:00.00,0,0:00.00,"(2.17, 1.38)"
+Elevator E 3 (Room 9),2,0:07.41,2,0:08.18,"(2.17, 2.41)"
+Elevator P72 (Room 10),0,0:00.00,1,0:02.60,"(2.16, 3.65)"
+Stairs P40 (Room 11),0,0:00.00,1,0:03.47,"(2.16, 1.74)"
+Door P6 1 (entrance to Room 2),0,0:00.00,,,
+Emergency exit P99 1 (entrance to Room 3),1,0:01.47,,,
+Door P95 1 (entrance to Room 4),0,0:00.00,,,
+Door P95 2 (entrance to Room 4),0,0:00.00,,,
+Toilet P9 (entrance to Room 5),0,0:00.00,,,
+Rotated B (entrance to Room 7),0,0:00.00,,,
+Emergency exit P99 2 (entrance to Room 10),0,0:00.00,,,
+Door P6 2 (entrance to Room 11),0,0:00.00,,,

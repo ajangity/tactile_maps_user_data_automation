@@ -13,7 +13,6 @@ Run every command below from the project folder (one level up from this file).
 ```bash
 python run_pipeline.py "S-19_Elevator.mp4" distractor_floorplan_E.png
 python run_pipeline.py video.mp4 map.png --no-display      # batch mode, no window
-python dashboard.py "data/<run folder>/dashboard.json"     # rebuild a dashboard later
 python edge_tracing.py distractor_floorplan_E.png          # see what edge tracing finds
 python symbol_identification.py distractor_floorplan_E.png # see what each symbol is named
 ```
@@ -31,13 +30,15 @@ Requires `opencv-python`, `mediapipe`, `numpy`, and `hand_landmarker.task` in th
 | `corner_fitting.py` | **Auto-crop part 2 (steps 9–17).** Turns edges into exact corners, refines the crop with the traced lines, picks the best crop. |
 | `edge_tracing.py` | Finds the printed black lines in an image, optionally only inside a region you give it. Once the map is locked, it only processes the pixels of the paper's crop (plus the 35% search margin while tracking, since the paper moves between frames). Before the map is found it traces the whole frame, because that's how the paper is found. |
 | `crop_checker.py` | Sanity checks (step 14), Backup #1 PNG/SIFT (18), Backup #2 optical flow (19), and the rigid-paper and visible-corner checks (21). |
-| `auto_crop.py` | The running order of the crop steps. Also searches for the map before it's found and recovers when it's lost (step 20). |
+| `auto_crop.py` | The running order of the crop steps. Also searches for the map before it's found, and again whenever it leaves the frame (step 20). |
 | `manual_crop.py` | Stop the video and drag the crop's corners. Only runs when you press Space. |
 | `finger_tracking.py` | Steps 22–24: MediaPipe, mapping fingertips onto the map, and keeping Left/Right straight. |
 | `room_tracking.py` | Works out exactly which PNG pixels belong to each room, and which room each symbol is in. |
 | `symbol_identification.py` | Finds every symbol (including ones drawn on a wall), recognizes its shape, and names it: "Stairs zigzag", "Elevator E 2", "Door P6 1". Run it on a map PNG to check the names. |
-| `timing.py` | Enter/exit timers: one for the paper, one per room, one per symbol. |
-| `dashboard.py` | Saves the results JSON and builds the HTML dashboard. |
+| `timing.py` | Enter/exit timers: the main map-interaction timer, one per room, one per symbol. |
+| `dashboard.py` | Not used by a run any more. Rebuilds the HTML dashboard from an older run's `dashboard.json`. |
+| `data_export.py` | Writes the CSV / JSON data files for analysis (summary, room order, corner motion, finger positions). |
+| `units.py` | Converts map pixels to inches (the PNG is the whole 8.5 × 11 in sheet). |
 | `label_symbols.py` | Optional. Draws extra boxes by hand, each of which gets a timer too. |
 
 ## Outputs
@@ -47,18 +48,21 @@ Every run creates its own folder, named with the date and time, the floorplan PN
 ```
 data/
   2026-10-08_14-30-05__distractor_floorplan_E__S-19_Elevator/
-    map.json  rooms.png  frame_lines.json  finger_paths.png
-    session.json  dashboard.json  dashboard.html
+    summary.csv  room_order.csv  corner_motion.csv  corner_motion.json
+    map.json  floorplan.png  finger_paths.png  finger_positions.json
 ```
 
 | File | Contents |
 |---|---|
 | `map.json` | Every black line on the PNG as nodes and edges, plus the printed border, the rooms (exact outlines) and the symbols. If you rename rooms or symbols in it, the next run of the same floorplan picks those names up. |
-| `rooms.png` | Picture of the detected rooms and symbols, for checking. |
-| `frame_lines.json` | Same graph format, traced (inside the crop) from the video frame where the map was first found, in frame pixels and in PNG pixels. Includes the score breakdown for that crop. |
 | `finger_paths.png` | Left trail in red and right trail in blue, drawn on the map. |
-| `session.json` | Every frame: crop corners, how the crop was found, its score, and each fingertip. |
-| `dashboard.json` / `dashboard.html` | The results, and the dashboard (opens automatically). |
+| `summary.csv` | One row per room, labeled by the symbol in it (e.g. `Stairs zigzag (Room 1)`): Symbol Visits, Symbol Time, Room Visits, Room Time, Room Dimension in inches. Then a row per entrance symbol not used as a room label, and an `Entire map` row whose Room Time is the total time a finger was on the map. |
+| `room_order.csv` | Every room visit in order, revisits included, with Time Entered / Time Exited. |
+| `corner_motion.csv` / `corner_motion.json` | 4 times a second: how far each paper corner (TL, TR, BR, BL, the map's own corners) moved in frame pixels since the previous sample, as (dx, dy). Blank / `null` while the map isn't in the frame. |
+| `finger_positions.json` | Every frame: time, and each index fingertip's position in PNG pixels (`null` = not seen). |
+| `floorplan.png` | A copy of the map PNG used. |
+
+Times in the CSVs are video time, `M:SS.ss`. Room sizes are each room's bounding box converted to inches; `map.json` has them too (`size_in`), along with `page_in` and `px_per_inch`.
 
 Use `--data-dir somewhere/else` to put the run folders somewhere other than `data/`.
 
@@ -113,16 +117,19 @@ All map coordinates are the PNG's own pixels, in the PNG's own orientation.
 17. The best-scoring candidate wins if it scores at least 0.4. It's blended 65% new / 35% old.
 18. **Backup #1 (PNG):** SIFT-match the frame against the PNG near the last crop. The result must pass step 14 and score at least 0.35.
 19. **Backup #2 (optical flow):** follow up to 700 paper points from last frame. Same checks. The points are only picked when this backup actually runs (it used to cost 30% of every frame). If this fails too, the crop is held.
-20. Only steps 13/17 and Backup #1 count as confirming the crop. After 20 frames without confirmation the crop is "lost", and the whole-frame search (steps 2–4) runs every 3 frames. If several results are close, the one nearest the last crop wins.
+20. Only steps 13/17 and Backup #1 count as confirming the crop. After 20 frames without confirmation the map has left the frame: the crop is dropped and the script goes back to exactly its start-of-video state (no crop, whole-frame search every 10 frames, "The map has left the frame" on screen). It locks on again, the same way as at the start, once the map is back.
 21. The paper is rigid: if 3 corners stayed put and 1 jumped, the jump is corrected. Each corner is drawn green if it's visible and orange if it's covered.
 22. The script crops around the paper plus some margin, enlarges the crop up to 2.5×, and runs MediaPipe for the index fingertip of up to 2 hands.
 23. The fingertip goes crop → frame → PNG pixels, through a homography built fresh every frame from that frame's corners. It's marked `on_paper` if it lands on the map. The trail breaks instead of drawing a straight line across any jump over 140 px.
 24. Each hand is matched to whichever hand's wrist was closest last frame, solving both hands together. Then it's labeled Left/Right from a short, fading memory of MediaPipe's own Left/Right calls, weighted by MediaPipe's confidence. One low-confidence frame can't swap the labels, and a wrong label can't stick (MediaPipe's labels are reliable for a camera across the table).
-25. **Timers** (`timing.py`, plus `symbol_identification.SymbolTiming` for the symbols): one for the paper, one per room, and one per symbol (plus any boxes drawn with `label_symbols.py`). Every timer works the same way:
+25. **Timers** (`timing.py`, plus `symbol_identification.SymbolTiming` for the symbols).
+    - **The main timer** (`On paper`) times the total time the user interacts with the map. It runs on every frame at least one index fingertip is inside the map's pixels and pauses on the first frame none is (or the map isn't in the frame). No grace period and no minimum length. Its running total is on the status bar.
+
+    One timer per room and one per symbol (plus any boxes drawn with `label_symbols.py`) all work the same way:
     - **Entrances:** a symbol drawn on a wall marks a room's entrance, so its timer is an *entrance* timer. It covers the mark plus a little space around it, and records which room the entrance leads into.
     - **Start:** a finger enters the room's exact pixels.
     - **End:** no finger has been in it for 0.4 s, either because it left or because the hand vanished. The visit ends at the last moment a finger was actually inside.
     - **Two hands at once:** still one visit.
     - **Minimum length:** only visits of 1 second or more count. Shorter ones are "brushes".
     - **Result:** each room is *visited*, *brushed only*, or *missed* (never touched).
-26. When the video ends (or on q), everything in **Outputs** is saved and the dashboard opens.
+26. When the video ends (or on q), everything in **Outputs** is saved.

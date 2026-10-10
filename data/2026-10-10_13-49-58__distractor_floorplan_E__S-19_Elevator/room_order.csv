@@ -1,0 +1,30 @@
+Order,Time Entered,Time Exited
+Room 6,0:23.89,0:25.29
+Stairs zigzag (Room 1),0:25.32,0:30.73
+Elevator E 2 (Room 4),0:27.16,0:28.93
+Elevator E 2 (Room 4),0:29.60,0:34.07
+Dangerous area P10 (Room 7),0:32.70,0:35.90
+Elevator E 3 (Room 9),0:34.33,0:39.47
+Elevator E 2 (Room 4),0:35.94,0:37.47
+Stairs P40 (Room 11),0:38.37,0:41.84
+Elevator E 1 (Room 3),0:42.61,0:44.54
+Room 6,0:42.78,0:44.01
+Toilet P26 (Room 2),0:44.01,0:46.05
+Elevator E 1 (Room 3),0:45.85,0:52.65
+Elevator P27 (Room 5),0:48.98,0:51.28
+Elevator P27 (Room 5),0:52.69,0:56.72
+Elevator E 1 (Room 3),0:54.92,0:56.19
+Elevator P72 (Room 10),0:57.29,0:59.89
+Room 6,0:59.93,1:01.66
+Stairs zigzag (Room 1),1:00.93,1:02.80
+Elevator E 2 (Room 4),1:02.23,1:06.57
+Dangerous area P10 (Room 7),1:06.20,1:07.70
+Elevator E 3 (Room 9),1:07.40,1:10.44
+Room 6,1:10.47,1:11.47
+Elevator P27 (Room 5),1:10.70,1:12.20
+Elevator E 1 (Room 3),1:11.77,1:13.44
+Elevator P27 (Room 5),1:12.97,1:17.28
+Elevator E 1 (Room 3),1:16.68,1:18.98
+Elevator P27 (Room 5),1:24.38,1:33.76
+Elevator E 1 (Room 3),1:33.79,1:42.47
+Elevator P27 (Room 5),1:41.07,1:42.64

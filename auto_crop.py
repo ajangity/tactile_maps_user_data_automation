@@ -13,8 +13,10 @@ SEARCH_EVERY frames until a crop scores LOCK_SCORE. After that, each frame:
     trace lines -> candidates (traced-line refinement of last frame's crop,
     plus each paper blob's fitted corners) -> sanity checks -> score ->
     best one wins -> otherwise PNG backup -> optical-flow backup -> hold.
-If nothing has confirmed the crop for MAX_UNCONFIRMED frames, it's "lost"
-and the whole-frame search runs again every RECOVERY_EVERY frames.
+If nothing has confirmed the crop for MAX_UNCONFIRMED frames, the map has
+left the frame (or been turned over): the crop is dropped and it goes back
+to exactly the start-of-video state -- no crop, whole-frame search every
+SEARCH_EVERY frames until the map is found again.
 """
 
 import numpy as np
@@ -33,12 +35,9 @@ LOCK_SCORE = 0.60        # first lock / recovery: a crop must score this
 TRACK_SCORE = 0.40       # per frame: a candidate must score this (orientation is already known)
 STRONG_SCORE = 0.60      # a traced-line crop this good skips the paper-edge candidates
 SEARCH_EVERY = 10        # frames between whole-frame searches before the first lock
-MAX_UNCONFIRMED = 20     # frames of backup-only tracking before declaring "lost"
-RECOVERY_EVERY = 3       # frames between whole-frame searches while lost
+MAX_UNCONFIRMED = 20     # frames of backup-only tracking before the map counts as gone
 REALIGN_EVERY = 3        # frames between shift searches while the crop is unconfirmed
 COLD_START_REFINE = 3    # best N pre-scored candidates get the traced-line refinement
-NEAR_TIE = 0.85          # during recovery, results within 85% of the best count as a tie,
-                         # and the one nearest the last known crop wins
 
 
 def grown(corners, margin=None):
@@ -99,9 +98,9 @@ class AutoCrop:
         return self.corners is not None
 
     # ------------------------------------------------------------ steps 2-4: whole-frame search
-    def locate(self, frame, near=None):
+    def locate(self, frame):
         """Search the whole frame for the map. Returns (quad, score, detail)
-        or None. `near` (last known crop) breaks near-ties during recovery."""
+        or None."""
         if not hasattr(self, "frame_ink"):
             self._trace(frame)
         shape = frame.shape
@@ -129,9 +128,6 @@ class AutoCrop:
         best = max(results, key=lambda r: r[0])
         if best[0] < LOCK_SCORE:
             return None
-        if near is not None:
-            close = [r for r in results if r[0] >= NEAR_TIE * best[0]]
-            best = min(close, key=lambda r: float(np.sum(np.linalg.norm(r[1] - near, axis=1))))
         return best
 
     def _lock(self, frame, quad, score, detail, frame_index, source):
@@ -168,6 +164,17 @@ class AutoCrop:
         self._tick += 1
         if self.frames_since_confirmed >= MAX_UNCONFIRMED:
             self.lost = True
+
+    def _unlock(self):
+        """The map has left the frame: drop the crop and go back to the
+        start-of-video search (see update)."""
+        self.corners = None
+        self.source = "searching"
+        self.score = 0.0
+        self.corner_visible = [False] * 4
+        self.flow.prev = None
+        self.frames_since_confirmed = 0
+        self._tick = 0
 
     def reset(self, frame, corners):
         """Accept corners placed by hand (manual_crop.py) as the new crop."""
@@ -253,6 +260,8 @@ class AutoCrop:
             self._confirmed()
         else:
             self._backups(frame, prior, trusted)
+            if not self.locked:
+                return None
         self.flow.remember(frame, self.gray, self.corners)
 
         self.corners = correct_outlier_corner(self.corners, prior)          # step 21
@@ -290,11 +299,7 @@ class AutoCrop:
             self.source = "held"
         self._unconfirmed()
         if self.lost:                                                        # step 20
-            self.source = "lost"
-            if self._tick % RECOVERY_EVERY == 0:
-                self._trace(frame)          # lost: the paper could be anywhere now
-                found = self.locate(frame, near=prior)
-                if found:
-                    self.corners = np.asarray(found[1], np.float32)
-                    self.source, self.score, self.detail = "recovered", found[0], found[2]
-                    self._confirmed()
+            # Nothing has confirmed the crop for MAX_UNCONFIRMED frames: the
+            # map has left the frame. Back to the start-of-video search,
+            # which locks on again once it reappears.
+            self._unlock()

@@ -8,12 +8,12 @@ Everything a run creates is saved in its own folder:
 
 What happens, in order (each step lives in its own file):
   paper_locator.py   read the map PNG -> map.json (its lines as a graph,
-                     its rooms and symbols) and rooms.png
+                     its rooms and symbols)
   auto_crop.py       every frame: find / follow the paper's 4 corners
                      (edge_tracing, paper_locator, corner_fitting, crop_checker)
   finger_tracking.py every frame: fingertips -> map pixels, Left/Right
   timing.py          every frame: step the paper / room / symbol timers
-  dashboard.py       at the end: dashboard.json + dashboard.html
+  data_export.py     at the end: the CSV / JSON data files (see run())
 
 Keys while the video plays:
   c       show / hide the list of commands (on screen)
@@ -25,11 +25,8 @@ Keys while the video plays:
 """
 
 import argparse
-import json
 import os
-import pathlib
 import time
-import webbrowser
 
 import cv2
 import numpy as np
@@ -37,7 +34,7 @@ import numpy as np
 import edge_tracing
 import manual_crop
 from auto_crop import AutoCrop
-from dashboard import build_dashboard, save_dashboard_data
+from data_export import CornerMotion, clock, save_data_files
 from finger_tracking import FingerTracker
 from paper_locator import ReferenceMap, draw_paper_debug
 from symbol_identification import SymbolTiming
@@ -171,21 +168,20 @@ def previous_map_json(map_path, data_dir=DATA_DIR, exclude=None):
     return None
 
 
-def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=True):
+def run(video_path, map_path, data_dir=DATA_DIR, display=True):
     """Everything this run creates goes in one new folder (see make_run_dir):
-        map.json          the PNG's lines (nodes + edges), rooms and symbols
-        rooms.png         picture of the detected rooms and symbols
-        frame_lines.json  lines traced from the video frame the map was found in
-        finger_paths.png  left (red) / right (blue) trails on the map
-        session.json      every frame: crop, crop source + score, fingertips
-        dashboard.json    the results (timers, visits, order, paths)
-        dashboard.html    the dashboard
+        map.json               the map layout: rooms (labeled by symbol) and
+                               symbols, with their pixel coordinates
+        floorplan.png          the floor plan PNG
+        finger_paths.png       left (red) / right (blue) trails on the map
+        finger_positions.json  every frame's index fingertips in map pixels
+        summary.csv, room_order.csv, corner_motion.csv, corner_motion.json
+                               (see data_export.py)
     """
     run_dir = make_run_dir(map_path, video_path, data_dir)
     out = lambda name: os.path.join(run_dir, name)
     ref = ReferenceMap(map_path, json_path=out("map.json"),
                        names_from=previous_map_json(map_path, data_dir, exclude=run_dir))
-    cv2.imwrite(out("rooms.png"), ref.rooms.draw(ref.image))
     print(f"Saving this run to {run_dir}")
     print(f"Map: {len(ref.rooms.rooms)} rooms, {len(ref.rooms.symbols)} symbols, "
           f"{len(ref.data['lines']['edges'])} wall lines")
@@ -203,6 +199,7 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
     crop = AutoCrop(ref)
     tracker = FingerTracker(ref.w, ref.h)
     timing = SymbolTiming(ref.rooms, load_manual_boxes(map_path, ref.w, ref.h))
+    corner_motion = CornerMotion()
     window = manual_crop.VideoWindow("Video Tracker", frame_w, frame_h) if display else None
     show = {"trails": False, "edges": False, "trace": False, "commands": False}
     trail_hands = {"Left": True, "Right": True}   # l / r, under t
@@ -221,8 +218,11 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
         corners = crop.update(frame, frame_index)
         if crop.locked and not was_locked:
             print(f"Found the map at {timestamp_ms / 1000:.1f}s (score {crop.score:.2f})")
+        elif was_locked and not crop.locked:
+            print(f"Lost the map at {timestamp_ms / 1000:.1f}s (it left the frame); searching again")
         tips = tracker.update(frame, corners, frame_index, timestamp_ms, crop.source, crop.score)
         timing.step(tips, timestamp_ms)
+        corner_motion.update(frame_index, timestamp_ms, corners)
 
         if not display:
             if frame_index % int(round(10 * fps)) == 0:
@@ -239,6 +239,9 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
                 tracker.draw_trails(shown, H, [h for h, on in trail_hands.items() if on])
             if show["edges"]:
                 draw_paper_debug(shown, frame, corners)
+        elif crop.lock_info is not None:   # found earlier, since gone
+            banner(shown, "The map has left the frame - looking for it again...",
+                   "Tracking resumes once it's back. Press Space to place the corners by hand.")
         else:
             banner(shown, "Looking for the map...  (it isn't face-up on the table yet)",
                    "Press Space to place the corners by hand.")
@@ -263,7 +266,9 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
             st = crop.png.stats
             sift = (f"  matches: {st['matches']}  error: {st['error']:.1f}px  "
                     f"coverage: {100 * st['coverage']:.1f}%")
-        status = (f"crop: {crop.source} (score {crop.score:.2f}){sift}  hands: {len(tips)}  "
+        paper = timing.paper
+        status = (f"map time: {clock(paper.elapsed_ms())} ({'running' if paper.running else 'paused'})  "
+                  f"crop: {crop.source} (score {crop.score:.2f}){sift}  hands: {len(tips)}  "
                   f"in: {inside}  speed: {speed:.2f}x   [Space] fix crop  [t] trails  [w] tracing  [q] quit")
         y = shown.shape[0] - 15
         if show["trails"]:
@@ -312,19 +317,12 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True, open_dashboard=Tr
     trails = ref.image.copy()
     tracker.draw_trails(trails)
     cv2.imwrite(out("finger_paths.png"), trails)
-    with open(out("session.json"), "w", encoding="utf-8") as f:
-        json.dump(tracker.session_log, f, indent=1)
-    if crop.lock_info:
-        with open(out("frame_lines.json"), "w", encoding="utf-8") as f:
-            json.dump(crop.lock_info, f, indent=1)
-    data = save_dashboard_data(out("dashboard.json"), tracker, timing, ref,
-                               video_path, fps, timestamp_ms)
-    html = build_dashboard(data, map_path, out("dashboard.html"))
+    timing.finish()   # close any visit still open when the video ended
+    save_data_files(run_dir, timing, ref, tracker, corner_motion)
+    print(f"Total time interacting with the map: {clock(timing.paper.elapsed_ms())}")
     print(f"Saved everything to {run_dir}:")
     for name in sorted(os.listdir(run_dir)):
         print(f"  {name}")
-    if open_dashboard:
-        webbrowser.open(pathlib.Path(html).resolve().as_uri())
     return run_dir
 
 
@@ -335,10 +333,8 @@ def main():
     parser.add_argument("--data-dir", default=DATA_DIR,
                         help="where run folders are created (default: data/ next to this file)")
     parser.add_argument("--no-display", action="store_true", help="run with no window")
-    parser.add_argument("--no-open", action="store_true", help="don't open the dashboard at the end")
     args = parser.parse_args()
-    run(args.video, args.map, args.data_dir, display=not args.no_display,
-        open_dashboard=not args.no_open)
+    run(args.video, args.map, args.data_dir, display=not args.no_display)
 
 
 if __name__ == "__main__":
