@@ -42,6 +42,14 @@ class RegionTimer:
     def occupied(self):
         return self._start is not None
 
+    def elapsed_ms(self):
+        """Total so far: every finished visit, plus the visit in progress
+        once it has lasted MIN_VISIT_MS (until then it may still turn out
+        to be a brush, which doesn't count). For the live timer list."""
+        done = sum(v["duration_ms"] for v in self.visits)
+        current = self._last_inside - self._start if self.occupied else 0
+        return done + (current if current >= MIN_VISIT_MS else 0)
+
     def step(self, hands_inside, timestamp_ms):
         if hands_inside:
             if self._start is None:

@@ -17,7 +17,7 @@ python edge_tracing.py distractor_floorplan_E.png          # see what edge traci
 python symbol_identification.py distractor_floorplan_E.png # see what each symbol is named
 ```
 
-Keys while the video plays: **c** shows or hides the on-screen list of commands, **Space** stops the video so you can fix the crop by hand, **t** shows trails and rooms (then **l** / **r** turn the left / right trail on and off), **e** shows the paper-edge debug view, **w** shows the edge-tracing debug view, **[ / ]** changes speed, and **q** saves and quits.
+Keys while the video plays: **c** shows or hides the on-screen list of commands, **t** shows or hides a live list of every timer (e.g. "Stairs zigzag Room Timer (Room 1): 0:07.27", green while running), **Space** stops the video so you can fix the crop by hand, **f** shows trails and rooms (then **l** / **r** turn the left / right trail on and off), **e** shows the paper-edge debug view, **w** shows the edge-tracing debug view, **[ / ]** changes speed, and **q** saves and quits.
 
 Requires `opencv-python`, `mediapipe`, `numpy`, and `hand_landmarker.task` in this folder.
 

@@ -17,9 +17,10 @@ What happens, in order (each step lives in its own file):
 
 Keys while the video plays:
   c       show / hide the list of commands (on screen)
+  t       show / hide the list of every timer, live (on screen)
   Space   stop and fix the crop by hand (manual_crop.py)
-  t       show trails + rooms on the video      e   paper-edge debug view
-  l / r   (while t is on) left / right trail on/off
+  f       show trails + rooms on the video      e   paper-edge debug view
+  l / r   (while f is on) left / right trail on/off
   w       edge-tracing debug view               ] / [   faster / slower
   q       stop, save everything, quit
 """
@@ -34,7 +35,7 @@ import numpy as np
 import edge_tracing
 import manual_crop
 from auto_crop import AutoCrop
-from data_export import CornerMotion, clock, save_data_files
+from data_export import CornerMotion, clock, room_labels, save_data_files
 from finger_tracking import FingerTracker
 from paper_locator import ReferenceMap, draw_paper_debug
 from symbol_identification import SymbolTiming
@@ -73,10 +74,11 @@ def banner(shown, title, subtitle, row=0):
 
 COMMANDS = [   # (key, what it does, the show / trail_hands entry it toggles, if any)
     ("c", "show / hide this list of commands", None),
+    ("t", "show / hide the list of every timer", "timers"),
     ("Space", "pause and drag the crop's corners by hand", None),
-    ("t", "trails, room outlines and symbol boxes on the video", "trails"),
-    ("l", "left finger's trail on / off (while t is on)", "Left"),
-    ("r", "right finger's trail on / off (while t is on)", "Right"),
+    ("f", "trails, room outlines and symbol boxes on the video", "trails"),
+    ("l", "left finger's trail on / off (while f is on)", "Left"),
+    ("r", "right finger's trail on / off (while f is on)", "Right"),
     ("e", "paper-edge debug view (paper mask, search window, edges)", "edges"),
     ("w", "edge-tracing debug view (inside the crop)", "trace"),
     ("] / [", "play faster / slower (every frame is still processed)", None),
@@ -84,9 +86,17 @@ COMMANDS = [   # (key, what it does, the show / trail_hands entry it toggles, if
 ]
 
 
+def _panel(shown, x0, y0, w, h):
+    """The see-through black box behind an on-screen panel."""
+    fill = shown.copy()
+    cv2.rectangle(fill, (x0, y0), (x0 + w, y0 + h), (0, 0, 0), -1)
+    cv2.addWeighted(fill, 0.75, shown, 0.25, 0, dst=shown)
+
+
 def draw_commands(shown, open_, state):
     """Top-right corner: a "press c" hint, or (once c is pressed) every key
-    and what it does, with the on/off state of the ones that toggle."""
+    and what it does, with the on/off state of the ones that toggle.
+    Returns the panel's left edge (the timers panel goes left of it)."""
     font, scale, pad, line = cv2.FONT_HERSHEY_SIMPLEX, 0.6, 12, 30
     if open_:
         rows = [("Commands", "", None)] + [
@@ -98,15 +108,73 @@ def draw_commands(shown, open_, state):
     text_w = max(cv2.getTextSize(t, font, scale, 1)[0][0] for _, t, _ in rows)
     w, h = key_w + text_w + 2 * pad, len(rows) * line + pad
     x0 = shown.shape[1] - w - 10
-    fill = shown.copy()
-    cv2.rectangle(fill, (x0, 10), (x0 + w, 10 + h), (0, 0, 0), -1)
-    cv2.addWeighted(fill, 0.75, shown, 0.25, 0, dst=shown)
+    _panel(shown, x0, 10, w, h)
     for i, (key, text, name) in enumerate(rows):
         y = 10 + pad + 15 + i * line
         on = name is not None and state[name]
         cv2.putText(shown, key, (x0 + pad, y), font, scale, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(shown, text, (x0 + pad + key_w, y), font, scale,
                     (40, 255, 40) if on else (255, 255, 255), 1, cv2.LINE_AA)
+    return x0
+
+
+def timer_list(timing, room_map):
+    """Every timer with an on-screen label, in display order: the main
+    timer, then each room followed by the symbol(s) it's named after, then
+    the remaining (entrance) symbols, then any hand-drawn boxes. A room is
+    named after its symbol, as in summary.csv: "Stairs zigzag Room Timer
+    (Room 1)"; a room with no symbol is just "Room 6 Room Timer"."""
+    _, symbol_ids = room_labels(room_map)
+    symbol_timers = {t.symbol["id"]: t for t in timing.symbols}
+    out = [("Map Interaction Timer (main)", timing.paper)]
+    used = set()
+    for r in room_map.rooms:
+        ids = [i for i in symbol_ids[r["id"]] if i in symbol_timers]
+        names = " / ".join(symbol_timers[i].name for i in ids)
+        out.append((f"{names} Room Timer ({r['name']})" if names else f"{r['name']} Room Timer",
+                    timing.rooms[r["id"]]))
+        out += [(_symbol_label(symbol_timers[i]), symbol_timers[i]) for i in ids]
+        used.update(ids)
+    out += [(_symbol_label(t), t) for i, t in symbol_timers.items() if i not in used]
+    out += [(f"{t.name} {t.kind.capitalize()} Timer", t) for t in timing.manual]
+    return out
+
+
+def _symbol_label(timer):
+    if timer.entrance:
+        return f"{timer.name} Entrance Timer" + (f" (to {timer.room})" if timer.room else "")
+    return f"{timer.name} Symbol Timer"
+
+
+def draw_timers(shown, open_, timers, right):
+    """Top right, left of the commands panel: a "press t" hint, or (once t
+    is pressed) every timer and its time so far -- "Stairs zigzag Room
+    Timer (Room 1): 0:07.27". Green = a finger is in it right now. Rooms
+    and symbols only count visits of >= 1 s (see timing.py), so their time
+    starts moving 1 s into a visit; the main timer counts every frame.
+    Rows that don't fit the frame's height wrap into more columns."""
+    font, scale, pad = cv2.FONT_HERSHEY_SIMPLEX, (0.5 if open_ else 0.6), 12
+    line = 24 if open_ else 30
+    if open_:
+        rows = [(f"{label}: {clock(t.elapsed_ms())}", t.occupied) for label, t in timers]
+        title = "Timers  (green = running)"
+    else:
+        rows, title = [], "Press t to view timers"
+    title_w = cv2.getTextSize(title, font, 0.6, 1)[0][0]
+    per_col = max(1, (shown.shape[0] - 160 - 2 * line) // line)   # keep clear of the status bar
+    columns = [rows[i:i + per_col] for i in range(0, len(rows), per_col)] or [[]]
+    col_w = max([cv2.getTextSize(text, font, scale, 1)[0][0] for text, _ in rows] or [0]) + 20
+    w = max(title_w, col_w * len(columns)) + 2 * pad
+    h = (1 + max(len(c) for c in columns)) * line + pad
+    x0 = max(10, right - w - 10)
+    _panel(shown, x0, 10, w, h)
+    cv2.putText(shown, title, (x0 + pad, 10 + pad + 15), font, 0.6,
+                (0, 255, 255) if open_ else (255, 255, 255), 2 if open_ else 1, cv2.LINE_AA)
+    for c, column in enumerate(columns):
+        for i, (text, running) in enumerate(column):
+            y = 10 + pad + 15 + (i + 1) * line
+            cv2.putText(shown, text, (x0 + pad + c * col_w, y), font, scale,
+                        (40, 255, 40) if running else (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def draw_regions(shown, H_map_to_frame, timing):
@@ -201,8 +269,9 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
     timing = SymbolTiming(ref.rooms, load_manual_boxes(map_path, ref.w, ref.h))
     corner_motion = CornerMotion()
     window = manual_crop.VideoWindow("Video Tracker", frame_w, frame_h) if display else None
-    show = {"trails": False, "edges": False, "trace": False, "commands": False}
-    trail_hands = {"Left": True, "Right": True}   # l / r, under t
+    timers = timer_list(timing, ref.rooms)
+    show = {"trails": False, "edges": False, "trace": False, "commands": False, "timers": False}
+    trail_hands = {"Left": True, "Right": True}   # l / r, under f
     speed = DEFAULT_PLAYBACK_SPEED
     frame_index, timestamp_ms, tips = 0, 0, []
     print("Searching for the map..." + ("" if display else " (batch mode, no window)"))
@@ -269,7 +338,7 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
         paper = timing.paper
         status = (f"map time: {clock(paper.elapsed_ms())} ({'running' if paper.running else 'paused'})  "
                   f"crop: {crop.source} (score {crop.score:.2f}){sift}  hands: {len(tips)}  "
-                  f"in: {inside}  speed: {speed:.2f}x   [Space] fix crop  [t] trails  [w] tracing  [q] quit")
+                  f"in: {inside}  speed: {speed:.2f}x   [Space] fix crop  [f] trails  [t] timers  [w] tracing  [q] quit")
         y = shown.shape[0] - 15
         if show["trails"]:
             trails = "trails:  " + "   ".join(f"{h} {'on' if on else 'off'}"
@@ -280,7 +349,8 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
                         cv2.LINE_AA)
         cv2.rectangle(shown, (0, y - 28), (shown.shape[1], shown.shape[0]), (0, 0, 0), -1)
         cv2.putText(shown, status, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 255, 40), 2, cv2.LINE_AA)
-        draw_commands(shown, show["commands"], {**show, **trail_hands})
+        left = draw_commands(shown, show["commands"], {**show, **trail_hands})
+        draw_timers(shown, show["timers"], timers, left)
         window.show(shown)
 
         wait = max(1, int(round(1000.0 / (fps * speed) - 1000.0 * (time.perf_counter() - started))))
@@ -298,6 +368,8 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
         elif key == ord("c"):
             show["commands"] = not show["commands"]
         elif key == ord("t"):
+            show["timers"] = not show["timers"]
+        elif key == ord("f"):
             show["trails"] = not show["trails"]
         elif key in (ord("l"), ord("r")) and show["trails"]:
             hand = "Left" if key == ord("l") else "Right"

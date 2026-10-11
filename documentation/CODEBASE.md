@@ -41,8 +41,9 @@ python label_symbols.py distractor_floorplan_E.png                              
 |---|---|
 | `c` | Show / hide the on-screen list of every command (a "Press c" hint is always in the top-right corner) |
 | Space | Stop the video and drag the crop's corners by hand (`manual_crop.py`) |
-| `t` | Trails, room outlines and symbol boxes on the video |
-| `l` / `r` | While `t` is on: turn the left / right finger's trail on or off |
+| `t` | Live list of every timer and its time so far (green = running) |
+| `f` | Trails, room outlines and symbol boxes on the video |
+| `l` / `r` | While `f` is on: turn the left / right finger's trail on or off |
 | `e` | Paper-edge debug view: paper mask, search window, edges colored by side |
 | `w` | Edge-tracing view, inside the crop only |
 | `[` / `]` | Slower / faster display. Every frame is still processed. |
