@@ -16,6 +16,7 @@ What happens, in order (each step lives in its own file):
   data_export.py     at the end: the CSV / JSON data files (see run())
 
 Keys while the video plays:
+  i       show / hide step-by-step instructions (on screen, top left)
   c       show / hide the list of commands (on screen)
   t       show / hide the list of every timer, live (on screen)
   Space   stop and fix the crop by hand (manual_crop.py)
@@ -63,16 +64,84 @@ def draw_crop(shown, corners, H_map_to_frame, ref, crop):
 
 
 def banner(shown, title, subtitle, row=0):
-    """Big readable message across the top of the frame."""
+    """Big readable message across the top of the frame. Returns its bottom
+    edge (the instructions panel goes below it)."""
     y = 60 + row * 85
     cv2.rectangle(shown, (0, y - 45), (shown.shape[1], y + 35), (0, 0, 0), -1)
     if title:
         cv2.putText(shown, title, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 255), 3, cv2.LINE_AA)
     cv2.putText(shown, subtitle, (20, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
                 cv2.LINE_AA)
+    return y + 35
+
+
+INSTRUCTIONS = [   # the numbered steps in the "i" panel
+    'Start it from the project folder: python run_pipeline.py "<video>.mp4" <map>.png '
+    "(add --no-display to run without this window).",
+    "Wait for the map to be found. Until the tactile map is face-up in view, a banner says "
+    '"Looking for the map...". Once found, it gets a green outline and its printed lines are '
+    "drawn over it in cyan.",
+    "Check the crop: the cyan lines should sit exactly on the map's printed walls. If they "
+    "don't, press Space, drag the 4 corners onto the paper's corners, then press Enter "
+    "(Esc cancels).",
+    "Let the video play. The bottom bar shows the main map-interaction timer (running "
+    "whenever an index finger is on the map) and which room or symbol a finger is in.",
+    "Press t to watch every timer live (green = running), and f to show finger trails, "
+    "room outlines and symbol boxes on the video (l / r turn each hand's trail on and off).",
+    "If the map leaves the frame, tracking and the timers pause and the search restarts; "
+    "it locks on again by itself once the map is back.",
+    "Use ] / [ to play faster or slower. Every frame is still processed, so results don't "
+    "depend on speed. Press c for the full list of keys.",
+    "When the video ends, or when you press q, everything is saved to "
+    "data/<date_time>__<map>__<video>/: data.csv, corner_motion.json, "
+    "finger_positions.json, finger_paths.png, map.json and floorplan.png.",
+    'Optional: rename rooms or symbols in that map.json (e.g. "Room 3" -> "Office"); the next '
+    "run of the same map uses your names. Symbol names come from the legend in legends/.",
+]
+
+
+def _wrap(text, font, scale, width):
+    """text split into lines no wider than width px."""
+    lines, line = [], ""
+    for word in text.split():
+        trial = f"{line} {word}".strip()
+        if line and cv2.getTextSize(trial, font, scale, 1)[0][0] > width:
+            lines.append(line)
+            line = word
+        else:
+            line = trial
+    return lines + [line]
+
+
+def draw_instructions(shown, open_, top=10):
+    """Top-left corner (below any banner): a "press i" hint, or (once i is
+    pressed) the numbered steps for using this script."""
+    font, scale, pad, line = cv2.FONT_HERSHEY_SIMPLEX, 0.55, 12, 24
+    if not open_:
+        title = "Press i for instructions"
+        w = cv2.getTextSize(title, font, 0.6, 1)[0][0] + 2 * pad
+        _panel(shown, 10, top, w, line + pad + 6)
+        cv2.putText(shown, title, (10 + pad, top + pad + 15), font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        return
+    width = min(620, shown.shape[1] // 2 - 60)
+    num_w = cv2.getTextSize("10.", font, scale, 2)[0][0] + 10
+    rows = []   # (step number on a step's first line, text)
+    for k, step in enumerate(INSTRUCTIONS, 1):
+        for j, text in enumerate(_wrap(step, font, scale, width - num_w)):
+            rows.append((f"{k}." if j == 0 else "", text))
+        rows.append(("", ""))   # space between steps
+    rows.pop()
+    _panel(shown, 10, top, width + 2 * pad, (len(rows) + 1) * line + pad + 6)
+    cv2.putText(shown, "How to use this script  (i to close)", (10 + pad, top + pad + 15), font, 0.6,
+                (0, 255, 255), 2, cv2.LINE_AA)
+    for i, (num, text) in enumerate(rows, 1):
+        y = top + pad + 15 + i * line
+        cv2.putText(shown, num, (10 + pad, y), font, scale, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(shown, text, (10 + pad + num_w, y), font, scale, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 COMMANDS = [   # (key, what it does, the show / trail_hands entry it toggles, if any)
+    ("i", "show / hide step-by-step instructions (top left)", "instructions"),
     ("c", "show / hide this list of commands", None),
     ("t", "show / hide the list of every timer", "timers"),
     ("Space", "pause and drag the crop's corners by hand", None),
@@ -122,15 +191,16 @@ def timer_list(timing, room_map):
     """Every timer with an on-screen label, in display order: the main
     timer, then each room followed by the symbol(s) it's named after, then
     the remaining (entrance) symbols, then any hand-drawn boxes. A room is
-    named after its symbol, as in summary.csv: "Stairs zigzag Room Timer
-    (Room 1)"; a room with no symbol is just "Room 6 Room Timer"."""
+    named after its legend symbol, as in summary.csv: "Stairs #5 Room
+    Timer (Room 1)"; the corridor after its legend texture: "Corridor #28
+    Room Timer (Room 6)"."""
     _, symbol_ids = room_labels(room_map)
     symbol_timers = {t.symbol["id"]: t for t in timing.symbols}
     out = [("Map Interaction Timer (main)", timing.paper)]
     used = set()
     for r in room_map.rooms:
         ids = [i for i in symbol_ids[r["id"]] if i in symbol_timers]
-        names = " / ".join(symbol_timers[i].name for i in ids)
+        names = " / ".join(symbol_timers[i].name for i in ids) or (r.get("pattern") or {}).get("name")
         out.append((f"{names} Room Timer ({r['name']})" if names else f"{r['name']} Room Timer",
                     timing.rooms[r["id"]]))
         out += [(_symbol_label(symbol_timers[i]), symbol_timers[i]) for i in ids]
@@ -148,7 +218,7 @@ def _symbol_label(timer):
 
 def draw_timers(shown, open_, timers, right):
     """Top right, left of the commands panel: a "press t" hint, or (once t
-    is pressed) every timer and its time so far -- "Stairs zigzag Room
+    is pressed) every timer and its time so far -- "Stairs #5 Room
     Timer (Room 1): 0:07.27". Green = a finger is in it right now. Rooms
     and symbols only count visits of >= 1 s (see timing.py), so their time
     starts moving 1 s into a visit; the main timer counts every frame.
@@ -270,7 +340,8 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
     corner_motion = CornerMotion()
     window = manual_crop.VideoWindow("Video Tracker", frame_w, frame_h) if display else None
     timers = timer_list(timing, ref.rooms)
-    show = {"trails": False, "edges": False, "trace": False, "commands": False, "timers": False}
+    show = {"trails": False, "edges": False, "trace": False, "commands": False, "timers": False,
+            "instructions": False}
     trail_hands = {"Left": True, "Right": True}   # l / r, under f
     speed = DEFAULT_PLAYBACK_SPEED
     frame_index, timestamp_ms, tips = 0, 0, []
@@ -300,6 +371,7 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
             continue
 
         shown = frame.copy()
+        top = 10   # where the instructions panel starts: below any banner
         if corners is not None:
             H = cv2.getPerspectiveTransform(ref.corners, np.float32(corners))
             draw_crop(shown, corners, H, ref, crop)
@@ -309,20 +381,21 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
             if show["edges"]:
                 draw_paper_debug(shown, frame, corners)
         elif crop.lock_info is not None:   # found earlier, since gone
-            banner(shown, "The map has left the frame - looking for it again...",
-                   "Tracking resumes once it's back. Press Space to place the corners by hand.")
+            top = banner(shown, "The map has left the frame - looking for it again...",
+                         "Tracking resumes once it's back. Press Space to place the corners by hand.") + 10
         else:
-            banner(shown, "Looking for the map...  (it isn't face-up on the table yet)",
-                   "Press Space to place the corners by hand.")
+            top = banner(shown, "Looking for the map...  (it isn't face-up on the table yet)",
+                         "Press Space to place the corners by hand.") + 10
             if show["trails"]:
-                banner(shown, "", "Trails and rooms appear once the map has been found.", row=2)
+                top = banner(shown, "", "Trails and rooms appear once the map has been found.", row=2) + 10
         if show["trace"]:
             if corners is not None:
                 # Only the paper's own pixels: the crop is the trace region.
                 edge_tracing.draw_trace(shown, edge_tracing.Trace(
                     crop.gray, wall_min=40, region=corners))
             else:
-                banner(shown, "", "Edge tracing runs inside the crop - there's no crop yet.", row=1)
+                top = max(top, banner(shown, "", "Edge tracing runs inside the crop - there's no crop yet.",
+                                      row=1) + 10)
         for tip in tips:
             color = (0, 0, 255) if tip["hand"] == "Left" else (255, 0, 0)
             p = (int(tip["frame_x"]), int(tip["frame_y"]))
@@ -351,6 +424,7 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
         cv2.putText(shown, status, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 255, 40), 2, cv2.LINE_AA)
         left = draw_commands(shown, show["commands"], {**show, **trail_hands})
         draw_timers(shown, show["timers"], timers, left)
+        draw_instructions(shown, show["instructions"], top)
         window.show(shown)
 
         wait = max(1, int(round(1000.0 / (fps * speed) - 1000.0 * (time.perf_counter() - started))))
@@ -367,6 +441,8 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
             speed = max(0.25, speed - 0.25)
         elif key == ord("c"):
             show["commands"] = not show["commands"]
+        elif key == ord("i"):
+            show["instructions"] = not show["instructions"]
         elif key == ord("t"):
             show["timers"] = not show["timers"]
         elif key == ord("f"):

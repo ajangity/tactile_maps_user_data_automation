@@ -41,6 +41,7 @@ python label_symbols.py distractor_floorplan_E.png                              
 |---|---|
 | `c` | Show / hide the on-screen list of every command (a "Press c" hint is always in the top-right corner) |
 | Space | Stop the video and drag the crop's corners by hand (`manual_crop.py`) |
+| `i` | Step-by-step instructions for using the script (top left, below any banner) |
 | `t` | Live list of every timer and its time so far (green = running) |
 | `f` | Trails, room outlines and symbol boxes on the video |
 | `l` / `r` | While `f` is on: turn the left / right finger's trail on or off |
@@ -210,15 +211,17 @@ On video frames the wall threshold is 40 px, since the map is smaller in the fra
 |---|---|
 | `find_wall_symbols(trace)` | Symbols drawn on a wall, which edge tracing counts as wall. Erases every straight wall run ≥ 45 px (morphological opening, horizontal and vertical); leftovers 10–80 px across are symbols. Also picks up hollow rings small enough to be classed as dots. |
 | `find_wall_gaps(trace)` | Doorways: along each wall line (long runs at the same x or y), a stretch with no ink 10–70 px long |
-| `merge_doorways` | A gap and the wall symbols within 20 px of it are one door (two ticks either side of a gap, four circles around one). A gap with no symbol is a door of kind `gap`. |
+| `merge_doorways` | A gap and the wall symbols within 20 px of it are one door (two ticks either side of a gap, four circles around one). The merged door is recognized as a whole; a gap with no symbol is legend #14. |
 | `find_symbols(trace)` | Those plus `Trace.symbol_marks()`, with overlapping ones merged |
 | `normalize`, `thin` | Ink → 1 px centre lines (Zhang-Suen) → scaled into a 48×48 box, proportions kept |
-| `recognize(ink, box)` | Chamfer distance to every drawing in `TEMPLATES`, at 0/90/180/270°. The best wins if ≤ `MATCH_MAX` (1.5 px); otherwise `unknown`. Orientation is part of some kinds: an open box is `open-box-up` / `-right` / `-down`, an E turned clockwise is `E-down`. |
-| `name_symbols`, `load_legend` | `LEGEND` maps a shape to a display name (referent + code from the user study's symbol catalogue, e.g. "Elevator P27"); a key ending in `@wall` applies to symbols on a wall; `<map>.legend.json` overrides it per map. Repeated names are numbered in reading order. |
+| `load_legend` | Reads `legends/symbol_legend.json`; each entry's template is its drawing cropped from the legend screenshot (`box`), as normalized centre lines. Gap / area-pattern entries have no template. |
+| `recognize(ink, box, on_wall, wall_vertical)` | Chamfer distance to every legend template. Free-standing: upright, other turns + `ROTATION_PENALTY` (1 px), since orientation changes meaning (#2 vs #12). On a wall: turned so the wall is horizontal, as the legend draws it (`wall_is_vertical`), both ways round. The best wins if ≤ `MATCH_MAX` (1.5 px); otherwise `legend_id` None, "Unknown symbol". Doorways are matched with the wall stubs inside them. |
+| `name_symbols`, `legend_name` | Name = `<referent> #<legend id>` ("Elevator #11"); `<map>.legend.json` (`{"<id>": "name"}`) renames entries per map. Repeated names are numbered in reading order: "Elevator #11 (1)". |
+| `corridor_pattern` | The corridor's dot texture: nearest-neighbour steps mostly straight → #28, diagonal → #29. `paper_locator` stores it on the room as `pattern`, so the corridor is labeled "Corridor #28". |
 | `detect_symbols(trace, labels, map_path)` | The "symbols" section of `map.json`: each symbol + 6 px padding, tagged with its room. A symbol on a wall is an entrance: `entrance`, `entrance_to` (the rooms touching it, minus the corridor) and `entrance_zone` (the mark + 18 px) |
-| `restore_auto_names` | After `paper_locator` carries names over from the last run, puts back the generated name wherever the old one was never edited |
+| `restore_auto_names` | After `paper_locator` carries names over from the last run, puts back the generated name wherever the old one was never edited, or predates the legend (no `legend_id`) |
 | `SymbolTimer`, `SymbolTiming` | `timing.Timing` with symbol timers that also record `symbol`. Entrance symbols get type `"entrance"` and are timed over their `entrance_zone` |
-| CLI `main` | Prints every symbol's name, shape and match distance; saves `<map>.symbols.png` |
+| CLI `main` | Prints every symbol's name, legend description and match distance, and the corridor's pattern; saves `<map>.symbols.png` |
 
 On map E: 18 symbols (11 free-standing, 7 on walls), all recognized; correct matches score 0.0–1.0 px and the nearest wrong template ≥ 1.03 px. To add a shape, add a drawing to `TEMPLATES` and a name to `LEGEND`.
 
@@ -278,11 +281,15 @@ All map coordinates are the **PNG's own pixels, in the PNG's own orientation** (
   "border": [[54.0, 34.0], [759.0, 34.0], [759.0, 1002.0], [54.0, 1002.0]],
   "room_gap_px": 33,
   "rooms":   [{"id": 1, "name": "Room 1", "area_px": 27043, "centroid": [159.7, 102.0],
-               "bbox": [57, 37, 265, 168], "polygon": [[x, y], ...]}],
-  "symbols": [{"id": 1, "name": "Stairs zigzag", "auto_name": "Stairs zigzag", "kind": "stairs",
-               "rotation": 0, "match": 0.0, "on_wall": false,
+               "bbox": [57, 37, 265, 168], "polygon": [[x, y], ...], "size_in": [2.17, 1.36]},
+              {"id": 6, "name": "Room 6", ..., "pattern": {"legend_id": 28, "name": "Corridor #28",
+               "referent": "Corridor", "description": "Horizontal dots"}}],
+  "symbols": [{"id": 1, "name": "Stairs #5", "auto_name": "Stairs #5", "legend_id": 5,
+               "referent": "Stairs", "description": "Lines in a step-like pattern",
+               "rotation": 0, "match": 0.25, "on_wall": false,
                "room": 1, "bbox": [130, 73, 190, 133]},
-              {"id": 12, "name": "Rotated B", "kind": "B-rotated", "on_wall": true, "room": null,
+              {"id": 12, "name": "Toilet #4", "legend_id": 4, "referent": "Toilet",
+               "description": "Print letter \"B\"", "rotation": 270, "on_wall": true, "room": null,
                "bbox": [244, 521, 288, 557], "entrance": true, "entrance_to": [7],
                "entrance_zone": [232, 509, 300, 569]}]
 }
@@ -434,7 +441,7 @@ On map E this finds 11 rooms (10 rooms + the corridor). The sealing width it pic
 - **Speed.** Processing runs at ~6 fps; the first 21 s of S-19 stutter in display mode because of whole-frame searches every 10 frames.
 - **Display mode** was checked with a screenshot harness, not driven on a real screen.
 - **Auto-generated names.** Rooms are named `Room N` in reading order; rename them in `map.json`.
-- **Symbol names follow the user study's catalogue.** Everything on a wall is named as a door (`Door P6`, `Door P95`, `Door 4 dots`, `Door double circle`, `Door B`, `Door gap`), because on map E every room then has exactly one entrance; "4 dots" and "double circle" are the door variants in the study notes, and `Door B` is inferred from that pattern alone. Regular and small prints of a shape share one name. The catalogue's solid shapes have no templates yet. Only map E has been checked; a shape that isn't in the library comes out as "Unknown symbol". Wall symbols and doorways are only found on horizontal or vertical walls.
+- **Symbol names follow the legend in `legends/`.** A symbol is named after the legend entry it matches ("<referent> #<ID>"), wherever it's drawn: the circle-with-dot and the B on map E's walls match Toilet #1 and Toilet #4, though on a wall their timers are entrance timers. The legend's templates are its own low-resolution screenshot drawings (about 20 px across), so very similar entries (#13 circle vs #18, #21 triangle vs #23) are told apart by small margins; only map E has been checked. A symbol that matches nothing within 1.5 px comes out as "Unknown symbol". The area patterns #25–#27 aren't detected. Wall symbols and doorways are only found on horizontal or vertical walls.
 
 ---
 

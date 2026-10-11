@@ -27,9 +27,10 @@ the map (timing.InteractionTimer).
 
 Room labels: a room is named after the free-standing symbol(s) inside it,
 or, failing that, the entrance symbol(s) leading into it, followed by the
-room's own name from map.json -- e.g. "Stairs zigzag (Room 1)". A room
-with no symbol (the corridor) keeps its own name. Renaming a room in
-map.json (say to "Office") carries through: "Toilet P26 (Office)".
+room's own name from map.json -- e.g. "Stairs #5 (Room 1)". The corridor
+is named after its legend texture: "Corridor #28 (Room 6)". Symbol names
+come from the legend (see symbol_identification.py). Renaming a room in
+map.json (say to "Office") carries through: "Toilet #2 (Office)".
 """
 
 import csv
@@ -109,7 +110,7 @@ def room_labels(room_map):
     for r in room_map.rooms:
         syms = inside[r["id"]] or leading_in[r["id"]]
         symbol_ids[r["id"]] = [s["id"] for s in syms]
-        names = " / ".join(s["name"] for s in syms)
+        names = " / ".join(s["name"] for s in syms) or (r.get("pattern") or {}).get("name")
         labels[r["id"]] = f"{names} ({r['name']})" if names else r["name"]
     return labels, symbol_ids
 

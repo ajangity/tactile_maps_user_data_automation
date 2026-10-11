@@ -1,11 +1,19 @@
 """Symbol identification: what each symbol on the map *is*, by name.
 
-edge_tracing.py finds where the symbols are, but only as anonymous marks
-("Symbol 1", "Symbol 2", ...). This file gives each one a real name
-("Stairs zigzag", "Elevator E 2", "Door P6 1"), so the video overlay, rooms.png and the
-dashboard say what the viewer is looking at.
+edge_tracing.py finds where the symbols are, but only as anonymous marks.
+This file matches each one to the tactile-symbol legend and names it after
+the legend entry -- "Elevator #11", "Toilet #2", "Door / Emergency exit
+#15" -- the names the timers, the on-screen timer list, map.json and
+data.csv all use.
 
-How a symbol gets its name, in three steps:
+THE LEGEND lives in legends/: the three legend screenshots
+(symbol_legend_1-3.png) and symbol_legend.json, which lists every entry --
+its ID, referent ("Elevator"), description, and the box in its screenshot
+where the symbol is drawn. The symbol drawn in that box *is* the template:
+no shape is hard-coded here. To add a symbol, add a screenshot and a line
+to symbol_legend.json.
+
+How a symbol gets its name:
 
   1. FIND. Free-standing symbols come from edge tracing's symbol marks.
      Symbols drawn *on* a wall (a circle on a wall, a tick across it, a
@@ -17,40 +25,49 @@ How a symbol gets its name, in three steps:
      (find_wall_gaps): a short break along a wall line. A break and the wall
      symbols beside it are one door; a break with no symbol is a door too.
 
-  2. RECOGNIZE THE SHAPE. Each symbol's ink is scaled into a 48x48 box and
-     thinned to 1 px centre lines, then compared with a small library of
-     shape templates drawn in code (TEMPLATES below): stairs, E, star, plus,
-     ring, ... The comparison is a
-     chamfer distance -- on average, how many pixels apart are the two
-     drawings' lines -- tried at all four 90-degree rotations. The closest
-     template wins if it's close enough (MATCH_MAX); otherwise the symbol
-     is "unknown" and keeps a generic name.
+  2. RECOGNIZE. Each symbol (a whole doorway, once merged) is matched
+     against the legend: its ink and every legend template are scaled into
+     a 48x48 box and thinned to 1 px centre lines, then compared by chamfer
+     distance -- on average, how many pixels apart the two drawings' lines
+     are. The closest template wins if it's close enough (MATCH_MAX);
+     otherwise the symbol is "Unknown symbol". A doorway that is only a gap
+     is legend #14 ("Gap or break in wall").
+     Orientation is part of a symbol's meaning in the legend (a square open
+     at the top is a toilet, open at the right an elevator), so:
+       - a free-standing symbol is compared upright; a turned match only
+         wins if it beats every upright one by ROTATION_PENALTY.
+       - a symbol on a wall is compared relative to its wall, since the
+         legend draws every wall horizontal: on a vertical wall it's turned
+         a quarter turn first (either way round, as a door can face either
+         room). That's what tells a circle with the wall running through it
+         (#18) from one with a line across the wall (#19).
 
-  3. NAME IT. LEGEND turns a shape into a display name. A shape only has a
-     *meaning* by convention, and ours is the symbol catalogue of the
-     tactile-symbols user study: each name is the referent the shape stands
-     for plus its catalogue code ("Elevator P27", "Door P6"). That table is
-     the one place to edit, and a map can override it with its own
-     <map>.legend.json:
+  3. NAME IT: "<referent> #<legend id>", e.g. "Elevator #11". A name that
+     occurs more than once is numbered in reading order ("Elevator #11
+     (1)", "Elevator #11 (2)"), because every timer needs its own name.
+     A map can rename legend entries with its own <map>.legend.json:
 
-         {"star": "Emergency exit", "bar@wall": "Window"}
-
-     If the same name occurs more than once it's numbered in reading order
-     ("Elevator E 1", "Elevator E 2"), because every timer needs its own name.
+         {"28": "Hallway", "13": "Front door"}
 
   4. WRITE IT TO THE MAP JSON. detect_symbols builds the "symbols" section
-     of map.json: every symbol with its name, shape, room and box.
+     of map.json: every symbol with its name, legend id, referent,
+     description, room and box. The corridor (the room the texture dots
+     are in) is matched to the legend too -- dots in rows and columns are
+     #28, dots on diagonals #29 -- and paper_locator stores that on the
+     room, so it's labeled "Corridor #28" (corridor_pattern).
 
   5. TIME IT. SymbolTiming gives every symbol its own timer. A symbol on a
-     wall marks a room's entrance (a door circle, a tick, the sideways B),
-     so its timer is an "entrance" timer: it covers a little space around
-     the mark and records which room the entrance leads into. The results
-     land in dashboard.json under "boxes", like every other timer.
+     wall marks a room's entrance, whatever its referent (a toilet symbol
+     on a toilet's wall marks the way into it), so its timer is an
+     "entrance" timer: it covers a little space around the mark and records
+     which room the entrance leads into.
 
-Orientation is part of some symbols: a square missing its top side is a
-toilet (P26), missing its right side an elevator (P27), missing its bottom
-side a door (P29); an upright E is the elevator's first letter, the same E
-turned clockwise is the separate symbol P72.
+The area patterns #25-#27 have no mark of their own to match, so they are
+in the legend but never assigned.
+
+Symbols in the video are the same printed symbols: the crop maps every
+video pixel onto the PNG, so a fingertip on a symbol in the video lands on
+that symbol's box here, and is timed under its name.
 
 Run on its own to check what it sees on a map:
     python symbol_identification.py distractor_floorplan_E.png
@@ -65,6 +82,7 @@ import numpy as np
 
 import edge_tracing
 from edge_tracing import CLASS_DOT, CLASS_SYMBOL
+from room_tracking import detect_rooms
 from timing import RegionTimer, Timing
 
 # ---- finding symbols drawn on walls
@@ -87,55 +105,14 @@ THIN_SIZE = 96            # symbols are enlarged to this before thinning, to kee
 NORM_SIZE = 48            # symbols and templates are compared in a box this size
 NORM_INK = 40             # ... with the shape's longer side scaled to this
 MATCH_MAX = 1.5           # px (in the 48x48 box); a worse best match is "unknown"
+ROTATION_PENALTY = 1.0    # px added to a turned match of a free-standing symbol
 
-# Shape -> display name: what the shape stands for, plus its code in the
-# study's symbol catalogue ("Tactile Symbols User Study", Referents &
-# Symbols table). Codes are the regular-size ones; the smaller prints of
-# the same shape have their own codes there (P30 for P26, P31 for P27...).
-# A key ending in "@wall" is used instead when the symbol is drawn on a wall.
-LEGEND = {
-    "stairs": "Stairs zigzag",              # Nick Giudice's suggested stair symbol
-    "E": "Elevator E",                      # embossed first letter
-    "E-down": "Elevator P72",               # E turned 90 degrees clockwise
-    "E-rotated": "Rotated E",
-    "open-box-up": "Toilet P26",            # square without its top side
-    "open-box-right": "Elevator P27",       # square without its right side
-    "open-box-down": "Door P29",            # square without its bottom side
-    "open-box-left": "Open box",
-    "split-box": "Elevator P54",            # two rectangles side by side
-    "bullseye": "Toilet P9",                # circle with a filled circle inside
-    "L": "Toilet P34",
-    "rectangle": "Stairs P40",
-    "open-rectangle": "Stairs P35",         # rectangle without one short side
-    "four-boxes": "Stairs P7",              # four rectangles side by side
-    "three-lines": "Stairs P84",
-    "four-rings": "Emergency exit P99",     # four small circles in a diamond
-    "ring-line": "Emergency exit P48",      # circle with a line through its centre
-    "ring-line@wall": "Door P6",            # ... unless that line is the wall it sits on
-    # Everything on a wall is a door: on the study's maps each room has
-    # exactly one entrance, drawn as one of the door candidates below.
-    "gap": "Door gap",                      # a plain gap in the wall
-    "four-rings@wall": "Door 4 dots",       # four small circles around a gap
-    "bullseye@wall": "Door double circle",
-    "B-rotated@wall": "Door B",
-    "B@wall": "Door B",
-    "ring": "Door P6",
-    "T": "Door P95",
-    "bar@wall": "Door P95",                 # the T's bar crossing a wall
-    "bar": "Bar",
-    "caret": "Door P86",
-    "ring-slash": "Inaccessible area P47",  # circle with a diagonal line
-    "plus": "Dangerous area P10",
-    "x": "Dangerous area P98",
-    "triangle": "Dangerous area P17",
-    "diamond": "Dangerous area P42",
-    "star": "Reception P41",
-    "H": "Reception P74",
-    "square": "Reception P11",
-    "B": "Letter B",
-    "B-rotated": "Rotated B",
-    "unknown": "Unknown symbol",
-}
+# ---- the legend
+LEGEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legends")
+LEGEND_JSON = os.path.join(LEGEND_DIR, "symbol_legend.json")
+LEGEND_INK = 140          # legend screenshot pixels darker than this are ink
+GAP_LEGEND_ID = 14        # "Gap or break in wall": a doorway with no mark
+DOTS_LEGEND_ID = {"straight": 28, "diagonal": 29}   # the corridor's dot texture
 
 
 # ---------------------------------------------------------------- 1. find
@@ -216,20 +193,37 @@ def merge_doorways(symbols, gaps):
     """One entry per doorway. A gap and the wall symbols within DOOR_JOIN px
     of it are the same door (the two ticks either side of a gap, the four
     circles around one), so they become a single symbol covering all of
-    them. A gap with no symbol is a door of kind "gap"."""
+    them, recognized as a whole afterwards. parts = how many wall symbols
+    it absorbed; a gap with none is legend #14, a plain gap in the wall."""
     symbols = list(symbols)
     for gap in gaps:
         reach = (gap[0] - DOOR_JOIN, gap[1] - DOOR_JOIN, gap[2] + DOOR_JOIN, gap[3] + DOOR_JOIN)
         parts = [s for s in symbols if s["on_wall"] and _overlap(s["box"], reach)]
         boxes = [s["box"] for s in parts] + [gap]
-        door = {"kind": parts[0]["kind"] if parts else "gap",
-                "rotation": parts[0]["rotation"] if parts else 0,
-                "match": max((s["match"] for s in parts), default=0.0),
-                "on_wall": True, "gap": gap,
+        door = {"on_wall": True, "gap": gap, "parts": len(parts),
                 "box": (min(b[0] for b in boxes), min(b[1] for b in boxes),
                         max(b[2] for b in boxes), max(b[3] for b in boxes))}
         symbols = [s for s in symbols if not any(s is part for part in parts)] + [door]
     return symbols
+
+
+def wall_runs(trace):
+    """(vertical, horizontal): the walls' long straight runs, each way."""
+    walls = trace.walls
+    return (cv2.morphologyEx(walls, cv2.MORPH_OPEN, np.ones((WALL_RUN_MIN, 1), np.uint8)),
+            cv2.morphologyEx(walls, cv2.MORPH_OPEN, np.ones((1, WALL_RUN_MIN), np.uint8)))
+
+
+def wall_is_vertical(symbol, runs, reach=12):
+    """Which way the wall under a wall symbol runs: a doorway's gap says so
+    directly (it's a thin box along the wall); otherwise, whichever runs
+    there are more of around the symbol."""
+    if symbol.get("gap"):
+        x0, y0, x1, y1 = symbol["gap"]
+        return (y1 - y0) > (x1 - x0)
+    x0, y0, x1, y1 = symbol["box"]
+    area = (slice(max(0, y0 - reach), y1 + reach + 1), slice(max(0, x0 - reach), x1 + reach + 1))
+    return int(runs[0][area].sum()) > int(runs[1][area].sum())
 
 
 def _overlap(a, b):
@@ -305,107 +299,6 @@ def thin(mask):
             return img * 255
 
 
-def _lines(*strokes, size=(200, 200), closed=False, thickness=12):
-    canvas = np.zeros((size[1], size[0]), np.uint8)
-    for stroke in strokes:
-        cv2.polylines(canvas, [np.int32(stroke)], closed, 255, thickness, cv2.LINE_AA)
-    return canvas
-
-
-def _rings(*circles, size=(200, 200), thickness=10):
-    canvas = np.zeros((size[1], size[0]), np.uint8)
-    for cx, cy, r in circles:
-        cv2.circle(canvas, (cx, cy), r, 255, thickness, cv2.LINE_AA)
-    return canvas
-
-
-def _star(*sizes):
-    stars = []
-    for size in sizes:
-        pts = []
-        for k in range(10):
-            r = size if k % 2 == 0 else size * 0.42
-            a = -np.pi / 2 + k * np.pi / 5
-            pts.append((100 + r * np.cos(a), 100 + r * np.sin(a)))
-        stars.append(pts)
-    return _lines(*stars, closed=True, thickness=6)
-
-
-def _letter(ch):
-    canvas = np.zeros((260, 260), np.uint8)
-    cv2.putText(canvas, ch, (40, 220), cv2.FONT_HERSHEY_SIMPLEX, 8, 255, 14, cv2.LINE_AA)
-    return canvas
-
-
-def _e(width):
-    # spine + three bars; the middle bar is a little shorter, like the print
-    return _lines([(width, 0), (0, 0), (0, 200), (width, 200)], [(0, 100), (width * 0.9, 100)],
-                  size=(width, 200))
-
-
-def _open_box(height):
-    return _lines([(0, 0), (0, height), (200, height), (200, 0)], size=(200, height))
-
-
-def _grid(columns):
-    w = 60 * columns
-    return _lines([(0, 0), (w, 0), (w, 200), (0, 200)], closed=True, size=(w, 200)) | \
-        _lines(*[[(60 * k, 0), (60 * k, 200)] for k in range(1, columns)], size=(w, 200))
-
-
-UPRIGHT = {0: ""}                                    # any other way round: "<kind>-rotated"
-OPENING = {0: "-up", 1: "-right", 2: "-down", 3: "-left"}
-
-# kind -> (drawings, orientation). A kind may have several drawings
-# (different proportions of the same shape). orientation is None when the
-# shape means the same any way round; otherwise it maps the number of
-# quarter turns (anticlockwise) that bring the symbol onto the drawing to a
-# suffix for the kind, because on these maps a turned shape is a different
-# symbol: an open box is a toilet, an elevator or a door depending on which
-# side is open.
-TEMPLATES = {
-    "stairs": ([_lines([(0, 0), (100, 0), (100, 100), (200, 100), (200, 200)]),   # two steps, or three
-                _lines([(0, 0), (66, 0), (66, 66), (133, 66), (133, 133), (200, 133), (200, 200)])], None),
-    "E": ([_e(150), _e(100)], {0: "", 1: "-down"}),
-    "B": ([_letter("B")], UPRIGHT),
-    "open-box": ([_open_box(200)], OPENING),
-    "open-rectangle": ([_open_box(500)], None),
-    "split-box": ([_grid(2), _lines([(0, 0), (200, 0), (200, 200), (0, 200)], closed=True) |
-                   _lines([(100, 0), (100, 200)])], None),
-    "four-boxes": ([_grid(4)], None),
-    "three-lines": ([_lines([(0, 0), (200, 0)], [(0, 70), (200, 70)], [(0, 140), (200, 140)],
-                            size=(200, 140))], None),
-    "L": ([_lines([(0, 0), (0, 200), (130, 200)], size=(130, 200))], None),
-    "H": ([_lines([(0, 0), (0, 200)], [(160, 0), (160, 200)], [(0, 100), (160, 100)], size=(160, 200))], None),
-    "T": ([_lines([(0, 0), (0, 200)], [(0, 100), (150, 100)], size=(150, 200))], None),
-    "caret": ([_lines([(0, 100), (100, 0), (200, 100)], size=(200, 100))], None),
-    "plus": ([_lines([(100, 0), (100, 200)], [(0, 100), (200, 100)])], None),
-    "x": ([_lines([(0, 0), (200, 200)], [(200, 0), (0, 200)])], None),
-    "triangle": ([_lines([(100, 0), (200, 180), (0, 180)], closed=True, size=(200, 180))], None),
-    "diamond": ([_lines([(100, 0), (200, 100), (100, 200), (0, 100)], closed=True)], None),
-    "star": ([_star(95), _star(95, 45)], None),   # outline, or a star in a star
-    "rectangle": ([_lines([(0, 0), (200, 0), (200, 100), (0, 100)], size=(200, 100), closed=True)], None),
-    "square": ([_lines([(0, 0), (200, 0), (200, 200), (0, 200)], closed=True)], None),
-    "ring": ([_rings((100, 100, 90))], None),
-    "ring-line": ([_rings((100, 100, 90)) | _lines([(100, 10), (100, 190)], thickness=10)], None),
-    "ring-slash": ([_rings((100, 100, 90)) | _lines([(36, 36), (164, 164)], thickness=10)], None),
-    "bullseye": ([_rings((100, 100, 90), (100, 100, 28), (100, 100, 8))], None),
-    "four-rings": ([_rings((100, 22, 20), (100, 178, 20), (22, 100, 20), (178, 100, 20))], None),
-    "bar": ([_lines([(0, 6), (200, 6)], size=(200, 12))], None),
-}
-
-_template_cache = None
-
-
-def _templates():
-    global _template_cache
-    if _template_cache is None:
-        _template_cache = [(kind, normalize(drawing), orientation)
-                           for kind, (drawings, orientation) in TEMPLATES.items()
-                           for drawing in drawings]
-    return _template_cache
-
-
 def _chamfer(a, b):
     """Average distance (px) from each drawing's lines to the other's, both ways."""
     da = cv2.distanceTransform(np.where(a > 0, 0, 255).astype(np.uint8), cv2.DIST_L2, 3)
@@ -413,37 +306,82 @@ def _chamfer(a, b):
     return 0.5 * (float(db[a > 0].mean()) + float(da[b > 0].mean()))
 
 
-def recognize(ink, box):
-    """(kind, rotation_degrees, distance) for the symbol ink inside box.
+_legend_cache = None
 
-    kind is a key of LEGEND; "unknown" if nothing in TEMPLATES is close.
+
+def load_legend():
+    """legends/symbol_legend.json's entries ({"id", "referent", "description",
+    "placement", "image", "box"}), each with "template": the symbol cropped
+    from its screenshot as normalized centre lines (None for the entries
+    with no mark to match: the gap and the area patterns)."""
+    global _legend_cache
+    if _legend_cache is None:
+        with open(LEGEND_JSON, encoding="utf-8") as f:
+            entries = json.load(f)["symbols"]
+        images = {}
+        for e in entries:
+            e["template"] = None
+            if e.get("box"):
+                if e["image"] not in images:
+                    images[e["image"]] = cv2.imread(os.path.join(LEGEND_DIR, e["image"]),
+                                                    cv2.IMREAD_GRAYSCALE)
+                x0, y0, x1, y1 = e["box"]
+                cell = images[e["image"]][y0:y1, x0:x1]
+                e["template"] = normalize(np.where(cell < LEGEND_INK, 255, 0).astype(np.uint8))
+        _legend_cache = entries
+    return _legend_cache
+
+
+def legend_entry(legend_id):
+    return next((e for e in load_legend() if e["id"] == legend_id), None)
+
+
+def recognize(ink, box, on_wall=False, wall_vertical=False):
+    """(legend_id, rotation_degrees, distance) for the symbol ink inside box.
+
+    legend_id is None if no legend template is within MATCH_MAX. rotation
+    is the quarter turns (anticlockwise) that bring the symbol onto the
+    legend's drawing.
     """
     x0, y0, x1, y1 = [int(v) for v in box]
     shape = normalize(ink[max(0, y0):y1 + 1, max(0, x0):x1 + 1])
     if shape is None:
-        return "unknown", 0, float("inf")
-    best = ("unknown", 0, float("inf"))
-    for kind, template, orientation in _templates():
-        for quarter in range(4):
-            d = _chamfer(np.rot90(shape, quarter), template)
+        return None, 0, float("inf")
+    if on_wall:   # relative to the wall; the legend draws walls horizontal
+        turns = {1: 0.0, 3: 0.0} if wall_vertical else {0: 0.0, 2: 0.0}
+    else:
+        turns = {0: 0.0, 1: ROTATION_PENALTY, 2: ROTATION_PENALTY, 3: ROTATION_PENALTY}
+    best = (None, 0, float("inf"))
+    for entry in load_legend():
+        if entry["template"] is None:
+            continue
+        for quarter, penalty in turns.items():
+            d = _chamfer(np.rot90(shape, quarter), entry["template"]) + penalty
             if d < best[2]:
-                suffix = "" if orientation is None else orientation.get(quarter, "-rotated")
-                best = (kind + suffix, quarter * 90, d)
+                best = (entry["id"], quarter * 90, d)
     if best[2] > MATCH_MAX:
-        return "unknown", 0, best[2]
+        return None, 0, best[2]
     return best
 
 
 # ---------------------------------------------------------------- 3. name
 
-def load_legend(map_path=None):
-    """LEGEND, with <map>.legend.json's entries laid over it if that exists."""
-    legend = dict(LEGEND)
+def load_overrides(map_path=None):
+    """<map>.legend.json ({legend id: name}), if the map has one."""
     path = os.path.splitext(map_path)[0] + ".legend.json" if map_path else None
     if path and os.path.exists(path):
         with open(path, encoding="utf-8") as f:
-            legend.update(json.load(f))
-    return legend
+            return {str(k): v for k, v in json.load(f).items()}
+    return {}
+
+
+def legend_name(legend_id, overrides=None):
+    """A legend entry's display name: "<referent> #<id>", or the map's own
+    name for it from <map>.legend.json."""
+    if overrides and str(legend_id) in overrides:
+        return overrides[str(legend_id)]
+    entry = legend_entry(legend_id)
+    return f"{entry['referent']} #{legend_id}" if entry else "Unknown symbol"
 
 
 def is_default_name(name):
@@ -452,16 +390,14 @@ def is_default_name(name):
     return head == "Symbol" and tail.isdigit()
 
 
-def name_symbols(symbols, legend=None):
-    """Give every symbol dict (with a "kind") a unique "name", in place."""
-    legend = legend or LEGEND
-    base = [(s.get("on_wall") and legend.get(s["kind"] + "@wall")) or legend.get(s["kind"], s["kind"])
-            for s in symbols]
+def name_symbols(symbols, overrides=None):
+    """Give every symbol dict (with a "legend_id") a unique "name", in place."""
+    base = [legend_name(s["legend_id"], overrides) for s in symbols]
     seen = {}
     for s, name in zip(symbols, base):
         if base.count(name) > 1:
             seen[name] = seen.get(name, 0) + 1
-            s["name"] = f"{name} {seen[name]}"
+            s["name"] = f"{name} ({seen[name]})"
         else:
             s["name"] = name
     return symbols
@@ -470,19 +406,29 @@ def name_symbols(symbols, legend=None):
 def identify_symbols(trace, map_path=None):
     """Every symbol on the map, found, recognized and named.
 
-    Returns dicts with kind, name, rotation, match (chamfer distance; lower
-    is surer), on_wall and box (x0, y0, x1, y1), in reading order. A doorway
-    also has gap, the box of its break in the wall, when it has one.
+    Returns dicts with legend_id, referent, description, name, rotation,
+    match (chamfer distance; lower is surer), on_wall and box (x0, y0, x1,
+    y1), in reading order. A doorway also has gap, the box of its break in
+    the wall, when it has one.
     """
     ink, found = find_symbols(trace)
-    symbols = []
-    for box, on_wall in found:
-        kind, rotation, distance = recognize(ink, box)
-        symbols.append({"kind": kind, "rotation": rotation, "match": round(distance, 2),
-                        "on_wall": on_wall, "box": box})
-    symbols = merge_doorways(symbols, find_wall_gaps(trace))
+    symbols = merge_doorways([{"on_wall": on_wall, "box": box} for box, on_wall in found],
+                             find_wall_gaps(trace))
+    runs = wall_runs(trace)
+    door_ink = ink | trace.walls   # a doorway is matched with the wall stubs inside it
+    for s in symbols:
+        if s.get("gap") and not s["parts"]:
+            legend_id, rotation, distance = GAP_LEGEND_ID, 0, 0.0
+        elif s["on_wall"]:
+            legend_id, rotation, distance = recognize(door_ink if s.get("gap") else ink, s["box"],
+                                                      True, wall_is_vertical(s, runs))
+        else:
+            legend_id, rotation, distance = recognize(ink, s["box"])
+        entry = legend_entry(legend_id) or {}
+        s.update(legend_id=legend_id, referent=entry.get("referent"),
+                 description=entry.get("description"), rotation=rotation, match=round(distance, 2))
     symbols.sort(key=lambda s: (s["box"][1] // 40, s["box"][0]))
-    return name_symbols(symbols, load_legend(map_path))
+    return name_symbols(symbols, load_overrides(map_path))
 
 
 # ---------------------------------------------------------------- 4. map JSON
@@ -495,6 +441,34 @@ def corridor_id(trace, label_image):
         return 0
     values, counts = np.unique(ids, return_counts=True)
     return int(values[counts.argmax()]) if counts.max() > 0.5 * len(ids) else 0
+
+
+def corridor_pattern(trace, label_image, map_path=None):
+    """(room id, {legend_id, name, referent, description}) for the
+    corridor's dot texture, or None.
+
+    Dots laid out in rows and columns are legend #28 ("Horizontal dots"),
+    dots on diagonals #29 ("Diagonal dots"): each dot's nearest neighbour
+    sits straight across from it in the first case, at 45 degrees in the
+    second.
+    """
+    room = corridor_id(trace, label_image)
+    if not room:
+        return None
+    dots = np.where((trace.classes == CLASS_DOT) & (label_image == room), 255, 0).astype(np.uint8)
+    _, _, _, centres = cv2.connectedComponentsWithStats(dots, connectivity=8)
+    pts = centres[1:]
+    if len(pts) < 3:
+        return None
+    d = np.linalg.norm(pts[:, None] - pts[None], axis=2)
+    np.fill_diagonal(d, np.inf)
+    step = pts[d.argmin(axis=1)] - pts
+    angle = np.degrees(np.arctan2(np.abs(step[:, 1]), np.abs(step[:, 0])))   # 0..90
+    straight = np.mean(np.minimum(angle, 90 - angle) < 22.5) >= 0.5
+    legend_id = DOTS_LEGEND_ID["straight" if straight else "diagonal"]
+    entry = legend_entry(legend_id)
+    return room, {"legend_id": legend_id, "name": legend_name(legend_id, load_overrides(map_path)),
+                  "referent": entry["referent"], "description": entry["description"]}
 
 
 def detect_symbols(trace, label_image, map_path=None):
@@ -521,7 +495,9 @@ def detect_symbols(trace, label_image, map_path=None):
             "id": k,
             "name": found["name"],
             "auto_name": found["name"],
-            "kind": found["kind"],
+            "legend_id": found["legend_id"],
+            "referent": found["referent"],
+            "description": found["description"],
             "rotation": found["rotation"],
             "match": found["match"],
             "on_wall": found["on_wall"],
@@ -549,7 +525,8 @@ def restore_auto_names(previous_json, symbols):
     the new symbols. That is right for a name someone typed in by hand,
     but a name that was still the generated one (or an old "Symbol 7"
     placeholder) should follow symbol identification instead, so those
-    are set back to this run's auto_name.
+    are set back to this run's auto_name. So is every name from a map JSON
+    written before the legend (its symbols have no legend_id).
     """
     if not previous_json or not os.path.exists(previous_json):
         return symbols
@@ -560,7 +537,8 @@ def restore_auto_names(previous_json, symbols):
         return symbols
     if len(old) == len(symbols):
         for new, prev in zip(symbols, old):
-            if prev.get("name") == prev.get("auto_name") or is_default_name(prev.get("name")):
+            if (prev.get("name") == prev.get("auto_name") or is_default_name(prev.get("name"))
+                    or "legend_id" not in prev):
                 new["name"] = new["auto_name"]
     return symbols
 
@@ -592,7 +570,8 @@ class SymbolTimer(RegionTimer):
 
     def summary(self):
         out = super().summary()
-        out["symbol"] = {k: self.symbol[k] for k in ("id", "kind", "rotation", "on_wall")}
+        out["symbol"] = {k: self.symbol.get(k) for k in
+                         ("id", "legend_id", "referent", "description", "rotation", "on_wall")}
         if self.entrance:
             out["entrance_to"] = self.leads_to
             out["symbol_bbox"] = self.symbol["bbox"]
@@ -613,7 +592,7 @@ class SymbolTiming(Timing):
 # ---------------------------------------------------------------- CLI
 
 def main():
-    parser = argparse.ArgumentParser(description="Find and name the symbols on a map PNG.")
+    parser = argparse.ArgumentParser(description="Match the symbols on a map PNG to the legend.")
     parser.add_argument("map", help="the map PNG")
     parser.add_argument("-o", "--output", help="output picture (default: <map>.symbols.png)")
     args = parser.parse_args()
@@ -625,16 +604,19 @@ def main():
     symbols = identify_symbols(trace, args.map)
     for i, s in enumerate(symbols, 1):
         x0, y0, x1, y1 = s["box"]
-        print(f"  {i:2d}  {s['name']:<22} kind={s['kind']:<14} match={s['match']:<5} "
+        print(f"  {i:2d}  {s['name']:<34} {s['description'] or '':<44} match={s['match']:<5} "
               f"rot={s['rotation']:<3} {'on wall ' if s['on_wall'] else ''}at ({(x0 + x1) // 2},{(y0 + y1) // 2})")
-        color = (0, 0, 220) if s["kind"] == "unknown" else (200, 0, 0)
+        color = (0, 0, 220) if s["legend_id"] is None else (200, 0, 0)
         cv2.rectangle(image, (x0 - 6, y0 - 6), (x1 + 6, y1 + 6), color, 2)
         cv2.putText(image, s["name"], (x0 - 6, max(12, y0 - 10)), cv2.FONT_HERSHEY_SIMPLEX,
                     0.45, color, 1, cv2.LINE_AA)
+    corridor = corridor_pattern(trace, detect_rooms(trace.walls)[0], args.map)
+    if corridor:
+        print(f"  corridor: Room {corridor[0]} = {corridor[1]['name']} ({corridor[1]['description']})")
     out = args.output or os.path.splitext(args.map)[0] + ".symbols.png"
     cv2.imwrite(out, image)
-    unknown = sum(s["kind"] == "unknown" for s in symbols)
-    print(f"{len(symbols)} symbols, {unknown} not recognized. Saved {out}")
+    unknown = sum(s["legend_id"] is None for s in symbols)
+    print(f"{len(symbols)} symbols, {unknown} not matched to the legend. Saved {out}")
 
 
 if __name__ == "__main__":

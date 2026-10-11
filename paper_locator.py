@@ -93,6 +93,10 @@ class ReferenceMap:
         self.json_path = json_path or os.path.splitext(path)[0] + ".map.json"
         rooms, symbols = _keep_custom_names(names_from or self.json_path, rooms, symbols)
         symbol_identification.restore_auto_names(names_from or self.json_path, symbols)
+        corridor = symbol_identification.corridor_pattern(self.trace, label_image, path)
+        for room in rooms:   # the corridor is named after its legend texture ("Corridor #28")
+            if corridor and room["id"] == corridor[0]:
+                room["pattern"] = corridor[1]
         self.inches = PixelsToInches(self.w, self.h)
         for room in rooms:   # (width, height) of the room's bounding box on the paper
             room["size_in"] = list(self.inches.bbox_size(room["bbox"]))
