@@ -48,7 +48,7 @@ Every run creates its own folder, named with the date and time, the floorplan PN
 ```
 data/
   2026-10-08_14-30-05__distractor_floorplan_E__S-19_Elevator/
-    summary.csv  room_order.csv  corner_motion.csv  corner_motion.json
+    data.csv  corner_motion.json
     map.json  floorplan.png  finger_paths.png  finger_positions.json
 ```
 
@@ -56,9 +56,8 @@ data/
 |---|---|
 | `map.json` | Every black line on the PNG as nodes and edges, plus the printed border, the rooms (exact outlines) and the symbols. If you rename rooms or symbols in it, the next run of the same floorplan picks those names up. |
 | `finger_paths.png` | Left trail in red and right trail in blue, drawn on the map. |
-| `summary.csv` | One row per room, labeled by the symbol in it (e.g. `Stairs zigzag (Room 1)`): Symbol Visits, Symbol Time, Room Visits, Room Time, Room Dimension in inches. Then a row per entrance symbol not used as a room label, and an `Entire map` row whose Room Time is the total time a finger was on the map. |
-| `room_order.csv` | Every room visit in order, revisits included, with Time Entered / Time Exited. |
-| `corner_motion.csv` / `corner_motion.json` | 4 times a second: how far each paper corner (TL, TR, BR, BL, the map's own corners) moved in frame pixels since the previous sample, as (dx, dy). Blank / `null` while the map isn't in the frame. |
+| `data.csv` | Every table of the run in one sheet, side by side with an empty column between them (the layout of the team's spreadsheet). **Summary:** one row per room, labeled by the symbol in it (e.g. `Stairs zigzag (Room 1)`), with Symbol Visits, Symbol Time, Room Visits, Room Time and Room Dimension in inches; then a row per door, and an `Entire map` row whose Room Time is the total time a finger was on the map. **Room order:** every room visit in order, revisits included, with Time Entered / Time Exited. **Corners:** 4 times a second, how far each paper corner (TL, TR, BR, BL) moved in frame pixels since the previous sample; blank while the map isn't in the frame. |
+| `corner_motion.json` | The same corner vectors, one list per corner (`null` while the map isn't in the frame). |
 | `finger_positions.json` | Every frame: time, and each index fingertip's position in PNG pixels (`null` = not seen). |
 | `floorplan.png` | A copy of the map PNG used. |
 

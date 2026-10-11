@@ -104,7 +104,7 @@ The pipeline runs in 8 layers, top to bottom. Layers 4–6 repeat for every vide
    │      ▼ fingertips (PNG px, on_paper)                                │
 6  │ timing.py ◄── RoomMap (room pixels, symbol boxes), extra boxes      │
    └─────────────────────────────────────────────────────────────────────┘
-7 Results         data_export.py ─► summary.csv, room_order.csv, corner_motion.csv/.json, ...
+7 Results         data_export.py ─► data.csv (all tables side by side), corner_motion.json, ...
 8 Run folder      all 8 files in data/<date_time>__<map>__<video>/
 ```
 
@@ -209,13 +209,15 @@ On video frames the wall threshold is 40 px, since the map is smaller in the fra
 | Function | What it does |
 |---|---|
 | `find_wall_symbols(trace)` | Symbols drawn on a wall, which edge tracing counts as wall. Erases every straight wall run ≥ 45 px (morphological opening, horizontal and vertical); leftovers 10–80 px across are symbols. Also picks up hollow rings small enough to be classed as dots. |
+| `find_wall_gaps(trace)` | Doorways: along each wall line (long runs at the same x or y), a stretch with no ink 10–70 px long |
+| `merge_doorways` | A gap and the wall symbols within 20 px of it are one door (two ticks either side of a gap, four circles around one). A gap with no symbol is a door of kind `gap`. |
 | `find_symbols(trace)` | Those plus `Trace.symbol_marks()`, with overlapping ones merged |
 | `normalize`, `thin` | Ink → 1 px centre lines (Zhang-Suen) → scaled into a 48×48 box, proportions kept |
 | `recognize(ink, box)` | Chamfer distance to every drawing in `TEMPLATES`, at 0/90/180/270°. The best wins if ≤ `MATCH_MAX` (1.5 px); otherwise `unknown`. Orientation is part of some kinds: an open box is `open-box-up` / `-right` / `-down`, an E turned clockwise is `E-down`. |
 | `name_symbols`, `load_legend` | `LEGEND` maps a shape to a display name (referent + code from the user study's symbol catalogue, e.g. "Elevator P27"); a key ending in `@wall` applies to symbols on a wall; `<map>.legend.json` overrides it per map. Repeated names are numbered in reading order. |
 | `detect_symbols(trace, labels, map_path)` | The "symbols" section of `map.json`: each symbol + 6 px padding, tagged with its room. A symbol on a wall is an entrance: `entrance`, `entrance_to` (the rooms touching it, minus the corridor) and `entrance_zone` (the mark + 18 px) |
 | `restore_auto_names` | After `paper_locator` carries names over from the last run, puts back the generated name wherever the old one was never edited |
-| `SymbolTimer`, `SymbolTiming` | `timing.Timing` with symbol timers that also record `symbol` and `touch_ms` (all time inside, brushes included). Entrance symbols get type `"entrance"` and are timed over their `entrance_zone` |
+| `SymbolTimer`, `SymbolTiming` | `timing.Timing` with symbol timers that also record `symbol`. Entrance symbols get type `"entrance"` and are timed over their `entrance_zone` |
 | CLI `main` | Prints every symbol's name, shape and match distance; saves `<map>.symbols.png` |
 
 On map E: 18 symbols (11 free-standing, 7 on walls), all recognized; correct matches score 0.0–1.0 px and the nearest wrong template ≥ 1.03 px. To add a shape, add a drawing to `TEMPLATES` and a name to `LEGEND`.
@@ -323,7 +325,7 @@ Same graph format, traced inside the crop of the frame where the map was first f
 }
 ```
 
-Symbols use `"bbox"` instead of `"polygon"`, and `"room"` is the name of the room they're in. They also carry `"symbol"` (id, kind, rotation, on_wall) and `"touch_ms"`. A symbol on a wall has `"type": "entrance"`: its `"bbox"` is the entrance zone, `"room"` and `"entrance_to"` name the room it leads into, and `"symbol_bbox"` is the mark itself. In `path`, `null` marks a gap: the hand wasn't seen, it was too far off the map, or it jumped further than a hand can move in one frame.
+Symbols use `"bbox"` instead of `"polygon"`, and `"room"` is the name of the room they're in. They also carry `"symbol"` (id, kind, rotation, on_wall). A symbol on a wall has `"type": "entrance"`: its `"bbox"` is the entrance zone, `"room"` and `"entrance_to"` name the room it leads into, and `"symbol_bbox"` is the mark itself. In `path`, `null` marks a gap: the hand wasn't seen, it was too far off the map, or it jumped further than a hand can move in one frame.
 
 ---
 
@@ -432,7 +434,7 @@ On map E this finds 11 rooms (10 rooms + the corridor). The sealing width it pic
 - **Speed.** Processing runs at ~6 fps; the first 21 s of S-19 stutter in display mode because of whole-frame searches every 10 frames.
 - **Display mode** was checked with a screenshot harness, not driven on a real screen.
 - **Auto-generated names.** Rooms are named `Room N` in reading order; rename them in `map.json`.
-- **Symbol names follow the user study's catalogue**, with three guesses on map E: "Rotated B" isn't in the catalogue, the four circles at doorways are named Emergency exit P99 (the notes also mention a 4-dot door), and the bullseye is named Toilet P9 (the notes also mention a "double circle" door). Regular and small prints of a shape share one name. The catalogue's solid shapes have no templates yet. Only map E has been checked; a shape that isn't in the library comes out as "Unknown symbol". Wall-symbol detection assumes walls are horizontal or vertical on the PNG.
+- **Symbol names follow the user study's catalogue.** Everything on a wall is named as a door (`Door P6`, `Door P95`, `Door 4 dots`, `Door double circle`, `Door B`, `Door gap`), because on map E every room then has exactly one entrance; "4 dots" and "double circle" are the door variants in the study notes, and `Door B` is inferred from that pattern alone. Regular and small prints of a shape share one name. The catalogue's solid shapes have no templates yet. Only map E has been checked; a shape that isn't in the library comes out as "Unknown symbol". Wall symbols and doorways are only found on horizontal or vertical walls.
 
 ---
 
