@@ -316,6 +316,10 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
         data.csv, corner_motion.json
                                (see data_export.py)
     """
+    for path in (video_path, map_path):
+        if not os.path.isfile(path):
+            raise SystemExit(f"File not found: {path} (videos are in mp4_user_data/, "
+                             "maps in png_reference_maps/)")
     run_dir = make_run_dir(map_path, video_path, data_dir)
     out = lambda name: os.path.join(run_dir, name)
     ref = ReferenceMap(map_path, json_path=out("map.json"),
