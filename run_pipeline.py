@@ -1,4 +1,8 @@
-"""Run the whole pipeline on one video. This is the file you run:
+"""This file is the entry point. It runs the whole pipeline on one video and
+map, from loading the reference map through saving every output file for
+that run.
+
+Run the whole pipeline on one video. This is the file you run:
 
     python run_pipeline.py "S-19_Elevator.mp4" distractor_floorplan_E.png
     python run_pipeline.py video.mp4 map.png --no-display     (no window; batch)

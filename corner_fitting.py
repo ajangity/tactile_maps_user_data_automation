@@ -1,4 +1,8 @@
-"""Auto-crop, part 2 (pipeline steps 9-17): turn edges into exact corners.
+"""This file is the second half of auto-crop. It turns detected edges into
+exact pixel corners, refines them against the map's own printed lines,
+and smooths the result from frame to frame.
+
+Auto-crop, part 2 (pipeline steps 9-17): turn edges into exact corners.
 
 Step 9   weighted_points          -- points every 4 px along each edge
                                      segment, so long clean edges outweigh

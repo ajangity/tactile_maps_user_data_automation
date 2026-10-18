@@ -1,4 +1,7 @@
-"""The session's results: save them as JSON, and build the HTML dashboard.
+"""This file saves a session's results as JSON and builds a single offline
+HTML dashboard. It shows the map, every timer, and both hands' paths.
+
+The session's results: save them as JSON, and build the HTML dashboard.
 
 save_dashboard_data() writes <video>.dashboard.json at the end of a run
 (run_pipeline.py calls it). build_dashboard() turns that JSON into one

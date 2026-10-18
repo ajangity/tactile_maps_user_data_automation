@@ -1,4 +1,8 @@
-"""Crop checker: is a crop believable, and what to do when no crop is.
+"""This file sanity-checks every candidate crop. It also provides two
+backup methods, SIFT matching and optical flow, for when the normal
+detection can't find the page.
+
+Crop checker: is a crop believable, and what to do when no crop is.
 
 Step 14  check_quad      -- sanity checks every candidate crop must pass:
                             corners within 25 degrees of square, width/height

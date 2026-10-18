@@ -1,4 +1,7 @@
-"""The run's final data files, for analysis outside this project.
+"""This file writes the run's final data files, the combined CSV and
+corner-motion log among them, into the run folder at the end of a run.
+
+The run's final data files, for analysis outside this project.
 
 Written at the end of every run (run_pipeline.py calls save_data_files),
 into the run folder next to map.json and finger_paths.png:

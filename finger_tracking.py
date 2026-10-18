@@ -1,4 +1,8 @@
-"""Finger tracking (pipeline steps 22-24): where are the fingertips on the map.
+"""This file tracks up to two fingertips with MediaPipe each frame and maps
+them onto the reference map's pixel coordinates. It keeps left/right hand
+identity consistent across frames.
+
+Finger tracking (pipeline steps 22-24): where are the fingertips on the map.
 
 Step 22  hand_crop / MediaPipe   -- crop around the paper (plus margin),
                                     enlarge up to 2.5x, find the index

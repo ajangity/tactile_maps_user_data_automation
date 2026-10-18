@@ -1,4 +1,7 @@
-"""Temporary helper: run run_pipeline.py on every video with its paired map, one at a time.
+"""This file is a temporary helper that runs run_pipeline.py on every
+video/map pair in the data folders, one after another.
+
+Temporary helper: run run_pipeline.py on every video with its paired map, one at a time.
 
 Usage:
     python loop_pipeline.py

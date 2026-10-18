@@ -1,4 +1,7 @@
-"""Map pixels -> real-world inches.
+"""This file converts between map pixel coordinates and real-world inches,
+since every tactile map is printed on the same size paper.
+
+Map pixels -> real-world inches.
 
 The map PNG is the whole printed sheet, edge to edge, and every tactile map
 is printed on US Letter paper (8.5 x 11 inches). So the PNG's longer side is

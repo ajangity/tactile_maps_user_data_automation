@@ -1,4 +1,8 @@
-"""Edge tracing: find the printed black lines in an image, on their own.
+"""This file finds every printed black line and symbol mark in an image on
+its own, independent of the crop. It's used both to help locate the paper
+and to detect symbols.
+
+Edge tracing: find the printed black lines in an image, on their own.
 
 This file is self-contained on purpose: it doesn't import or depend on the
 auto-crop pipeline. It takes an image (the reference PNG, or a video frame)

@@ -1,4 +1,8 @@
-"""Auto-crop, part 1 (pipeline steps 1-8): know the map, find the paper.
+"""This file loads the reference map PNG and handles the first half of
+auto-crop. It finds candidate paper outlines, scores how well each one
+matches the map, and classifies their edges.
+
+Auto-crop, part 1 (pipeline steps 1-8): know the map, find the paper.
 
 Step 1  load_reference_map    -- read the PNG and write its map JSON: every
                                  black line as a graph (nodes + edges), the

@@ -1,4 +1,8 @@
-"""Room tracking: which exact pixels of the map belong to which room.
+"""This file works out which room each pixel of the map belongs to. It
+seals the doorway gaps in the walls, then grows each room out from its
+enclosed space.
+
+Room tracking: which exact pixels of the map belong to which room.
 
 Rooms aren't labeled anywhere in the PNG -- they're just the white spaces
 enclosed by the printed walls. The problem is the doorways: every room has

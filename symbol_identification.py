@@ -1,4 +1,7 @@
-"""Symbol identification: what each symbol on the map *is*, by name.
+"""This file matches every detected symbol mark to the tactile-symbol
+legend and names it. Symbols drawn on walls are handled as room entrances.
+
+Symbol identification: what each symbol on the map *is*, by name.
 
 edge_tracing.py finds where the symbols are, but only as anonymous marks.
 This file matches each one to the tactile-symbol legend and names it after

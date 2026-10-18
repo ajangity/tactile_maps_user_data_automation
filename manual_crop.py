@@ -1,4 +1,7 @@
-"""Manual crop: stop the video and drag the crop's corners by hand.
+"""This file lets you pause the video and drag the crop's corners into
+place by hand. It's for when auto-crop can't find the page on its own.
+
+Manual crop: stop the video and drag the crop's corners by hand.
 
 Not part of the automatic pipeline. It only runs when you press Space
 while the video is playing: the video freezes, the PNG is overlaid on the

@@ -1,4 +1,9 @@
-"""Auto-crop: runs the crop pipeline once per frame, in order.
+"""This file finds the paper's four corners every frame and keeps tracking
+them as it moves. It calls into paper_locator, corner_fitting,
+crop_checker, and edge_tracing in order, with backup methods if the
+normal detection fails.
+
+Auto-crop: runs the crop pipeline once per frame, in order.
 
 This file holds no image-processing logic of its own -- it's the running
 order, calling into:

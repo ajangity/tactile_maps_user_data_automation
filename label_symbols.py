@@ -1,4 +1,7 @@
-"""Optional extra boxes, drawn by hand on the reference map PNG.
+"""This file is an optional tool for manually drawing extra boxes on the
+map PNG. Use it for anything the automatic room/symbol detection misses.
+
+Optional extra boxes, drawn by hand on the reference map PNG.
 
 Rooms and symbols are now found automatically (room_tracking.py, saved in
 <map>.map.json), so this is only needed for an extra region the automatic

@@ -1,4 +1,8 @@
-"""Timing: one enter/exit timer per region the user's finger can be in.
+"""This file runs one enter/exit timer per room, symbol, and the paper
+itself. A touch only counts as a visit once it's held for at least a
+second.
+
+Timing: one enter/exit timer per region the user's finger can be in.
 
 Timers are created for:
   - the paper itself  ("On paper", the main timer: the total time the user
