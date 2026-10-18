@@ -153,7 +153,7 @@ table.steps tr.hl { background: var(--accent-soft); }
       <figure style="margin:0">
         <div class="diagram-wrap">
           <svg id="diagram" viewBox="0 0 1210 1205" role="img"
-               aria-label="Layered architecture: inputs (floorplan PNG, symbol legend, video, hand model) feed run_pipeline.py, which builds the reference map once (paper_locator with edge_tracing, room_tracking and symbol_identification), then every frame runs auto_crop (with paper_locator, corner_fitting, crop_checker, edge_tracing, manual_crop), finger_tracking and timing, and finally data_export.py writes data.csv and the JSON files into the run folder."></svg>
+               aria-label="Layered architecture: inputs (floorplan PNG, symbol legend, video, hand model) feed run_pipeline.py, which builds the reference map once (paper_locator with edge_tracing, room_tracking and symbol_identification), then every frame runs auto_crop (with paper_locator, corner_fitting, crop_checker, edge_tracing, manual_crop), finger_tracking and timing, and finally data_export.py writes summary.csv, room_order.csv, corner_motion.csv and the JSON files into the run folder."></svg>
         </div>
         <figcaption class="hint" style="margin-top:8px">Layers 4–6 (inside the orange dashed frame) run once for every video frame. Each green chip is a file the run saves into its <code>data/</code> folder, drawn next to the code that produces it.</figcaption>
       </figure>
@@ -204,7 +204,7 @@ table.steps tr.hl { background: var(--accent-soft); }
         "Start of a run: makes data/<YYYY-MM-DD_HH-MM-SS>__<map name>__<video name>/, finds the newest earlier run of the same floorplan so hand-edited room and symbol names carry over, and builds the ReferenceMap (which writes map.json).",
         "Every frame: reads the next frame, calls AutoCrop.update (layer 4), FingerTracker.update (layer 5), Timing.step (layer 6) and CornerMotion.update (samples the 4 corners 4× a second for data_export). Prints when the map is found and when it leaves the frame.",
         "Live window (display mode): the crop (green outline, labeled corners, the PNG's printed lines in cyan where the crop places them), fingertip dots, and a status bar with the main map-interaction timer (running / paused). Three panels open from small boxes along the top: i = numbered instructions for using the script (top left, below any banner), t = every timer live, labeled by its legend symbol and green while running, c = the list of keys (both top right).",
-        "End of run (video ends or q): closes any open visit, draws finger_paths.png, then calls data_export.save_data_files for data.csv, corner_motion.json, finger_positions.json and floorplan.png. Prints the total time on the map.",
+        "End of run (video ends or q): closes any open visit, draws finger_paths.png, then calls data_export.save_data_files for summary.csv, room_order.csv, corner_motion.csv, corner_motion.json, finger_positions.json and floorplan.png. Prints the total time on the map.",
       ],
       inputs: ["Video path (any OpenCV-readable video)", "Map PNG path", "--data-dir (default: data/ next to the code)", "--no-display (batch mode, no window)"],
       outputs: ["The run folder and all 6 files in it (most written through data_export.py)", "Live 'Video Tracker' window (display mode)", "Console progress"],
@@ -286,7 +286,7 @@ table.steps tr.hl { background: var(--accent-soft); }
     },
     symbol_identification: {
       title: "symbol_identification.py", kind: "Symbols", steps: "Step 1 (symbols) · timers in step 25",
-      lead: "Finds every symbol on the map, matches it to the tactile-symbol legend in legends/, and names it after the legend entry: \"Elevator #11\", \"Toilet #2\", \"Door / Emergency exit #15\". Those names are what the timers, the live timer list, map.json and data.csv use.",
+      lead: "Finds every symbol on the map, matches it to the tactile-symbol legend in legends/, and names it after the legend entry: \"Elevator #11\", \"Toilet #2\", \"Door / Emergency exit #15\". Those names are what the timers, the live timer list, map.json and the CSVs use.",
       body: [
         "Find: free-standing symbols are edge tracing's symbol marks. Symbols drawn on a wall count as wall to edge tracing, so find_wall_symbols erases every long straight wall run and keeps what's left (plus small hollow rings). find_wall_gaps finds doorways — breaks along a wall line — and merge_doorways makes a break and the marks beside it one door (two ticks either side of a gap, four circles around one).",
         "Recognize: each symbol (each whole doorway, once merged) and every legend template are thinned to 1 px centre lines in a 48×48 box and compared by chamfer distance. The templates are the symbols drawn in the legend screenshots themselves (load_legend crops them using symbol_legend.json). The closest one within 1.5 px wins; otherwise \"Unknown symbol\". A doorway that is only a gap is #14.",
@@ -394,7 +394,7 @@ table.steps tr.hl { background: var(--accent-soft); }
       title: "timing.py", kind: "Timers", steps: "Step 25",
       lead: "The main map-interaction timer, plus one enter/exit timer per room, per symbol (via symbol_identification.SymbolTiming), and per hand-drawn box.",
       body: [
-        "Main timer (InteractionTimer, 'On paper'): a stopwatch that runs on every frame at least one index fingertip is inside the map's pixels and pauses on the first frame none is — hands lifted, off the paper, or the map out of the frame. No grace period, no minimum. Its total is the user's time interacting with the map (the 'Entire map' row of data.csv; live on the status bar).",
+        "Main timer (InteractionTimer, 'On paper'): a stopwatch that runs on every frame at least one index fingertip is inside the map's pixels and pauses on the first frame none is — hands lifted, off the paper, or the map out of the frame. No grace period, no minimum. Its total is the user's time interacting with the map (the 'Entire map' row of summary.csv; live on the status bar).",
         "Room / symbol / box timers (RegionTimer): a visit starts the first frame any fingertip is inside and ends once none has been inside for 0.4 s; the end time is the last moment a finger was actually in. Two hands inside at once = one visit. Only visits of ≥ 1 s count; shorter ones are 'brushes'.",
         "elapsed_ms() gives each timer's total so far for the live t panel (a room's time starts moving once a visit reaches 1 s). sequence() is every visit in order — the path through the rooms.",
       ],
@@ -407,16 +407,16 @@ table.steps tr.hl { background: var(--accent-soft); }
     },
     data_export: {
       title: "data_export.py", kind: "Results", steps: "Step 26",
-      lead: "Writes the run's data files for analysis: data.csv (every table side by side in one sheet), corner_motion.json, finger_positions.json and a copy of the floorplan PNG.",
+      lead: "Writes the run's data files for analysis: summary.csv, room_order.csv and corner_motion.csv (one plain table each, so they open in Google Sheets), corner_motion.json, finger_positions.json and a copy of the floorplan PNG.",
       body: [
-        "data.csv, table 1 — summary: one row per room, labeled by its legend symbol (\"Stairs #5 (Room 1)\", the corridor \"Corridor #28 (Room 6)\"): Symbol Visits, Symbol Time, Room Visits, Room Time, Room Dimension (inches, from units.py). Then a row per entrance symbol (\"Door / Emergency exit #15 (entrance to Room 4)\"), and an 'Entire map' row whose Room Time is the main timer.",
-        "data.csv, table 2 — room order: every room visit in order, revisits included, with Time Entered / Time Exited. Table 3 — corners: CornerMotion samples the 4 crop corners 4× a second and records how far each moved (dx, dy in frame pixels) since the previous sample; blank while the map isn't in the frame.",
+        "summary.csv: one row per room, labeled by its legend symbol (\"Stairs #5 (Room 1)\", the corridor \"Corridor #28 (Room 6)\"): Symbol Visits, Symbol Time, Room Visits, Room Time, Room Dimension (inches, from units.py). Then a row per entrance symbol (\"Door / Emergency exit #15 (entrance to Room 4)\"), and an 'Entire map' row whose Room Time is the main timer.",
+        "room_order.csv: every room visit in order, revisits included, with Time Entered / Time Exited. corner_motion.csv: CornerMotion samples the 4 crop corners 4× a second and records how far each moved (dx, dy in frame pixels) since the previous sample; blank while the map isn't in the frame.",
         "corner_motion.json is the same vectors, one list per corner: {\"TL\": [[dx, dy], …], \"TR\": …, \"BR\": …, \"BL\": …}, lined up with table 3's rows (null = map not in the frame). finger_positions.json: every frame's time and each index fingertip in PNG pixels.",
-        "Times are video time, M:SS.ss.",
+        "Times are video time in plain seconds (M:SS.ss is read as a clock time by Google Sheets).",
       ],
       inputs: ["Timing (finished)", "ReferenceMap (rooms, symbols, inches)", "FingerTracker session log", "CornerMotion (fed every frame by run_pipeline)"],
-      outputs: ["data.csv", "corner_motion.json", "finger_positions.json", "floorplan.png"],
-      funcs: [["save_data_files(run_dir, timing, ref, tracker, corners)", "Writes every file."], ["CornerMotion.update / to_json / rows", "Corner vectors, 4× a second."], ["summary_rows / order_rows / side_by_side", "The three tables, in one sheet."], ["room_labels(room_map)", "\"<symbol> (<room>)\" labels, shared with the live timer list."], ["clock(ms)", "M:SS.ss."]],
+      outputs: ["summary.csv", "room_order.csv", "corner_motion.csv", "corner_motion.json", "finger_positions.json", "floorplan.png"],
+      funcs: [["save_data_files(run_dir, timing, ref, tracker, corners)", "Writes every file."], ["CornerMotion.update / to_json / rows", "Corner vectors, 4× a second."], ["summary_rows / order_rows", "The summary and room-order tables."], ["room_labels(room_map)", "\"<symbol> (<room>)\" labels, shared with the live timer list."], ["seconds(ms)", "Seconds for the CSVs."], ["clock(ms)", "M:SS.ss, for the live window."]],
       settings: [["CORNER_SAMPLES_PER_SECOND", "4", "Corner-motion sampling"]],
       calls: ["units"], calledBy: ["run_pipeline"],
       notes: [],
@@ -424,7 +424,7 @@ table.steps tr.hl { background: var(--accent-soft); }
     units: {
       title: "units.py", kind: "Pixels → inches", steps: "Steps 1 and 26",
       lead: "Converts map pixels to real-world inches. The PNG is the whole printed sheet, US Letter (8.5 × 11 in), so its longer side is 11 in and its shorter 8.5 in — exactly 96 px per inch for the 816 × 1056 floorplans.",
-      body: ["Every coordinate in the project is already in PNG pixels (fingertips are mapped through the crop), so this one conversion covers rooms, symbols and finger paths. Room sizes are each room's bounding box in inches, stored in map.json (size_in, with page_in and px_per_inch) and in data.csv's Room Dimension column.", "Run on its own: python units.py map.png prints each room's size."],
+      body: ["Every coordinate in the project is already in PNG pixels (fingertips are mapped through the crop), so this one conversion covers rooms, symbols and finger paths. Room sizes are each room's bounding box in inches, stored in map.json (size_in, with page_in and px_per_inch) and in summary.csv's Room Dimension column.", "Run on its own: python units.py map.png prints each room's size."],
       inputs: ["PNG width and height"], outputs: ["PixelsToInches: point(), size(), bbox_size()"],
       funcs: [["PixelsToInches(w, h)", "The converter (one scale per axis)."]],
       settings: [["PAGE_INCHES", "8.5 × 11", "Physical sheet size"]],
@@ -454,11 +454,11 @@ table.steps tr.hl { background: var(--accent-soft); }
     symbols_json: { title: "<map>.symbols.json", kind: "Optional input", steps: "Read in step 25", lead: "Extra hand-drawn boxes from label_symbols.py, next to the PNG. Each becomes a timer.", body: [], inputs: ["Written by label_symbols.py"], outputs: ["Read by timing.load_manual_boxes"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     map_json: { title: "map.json", kind: "Saved file", steps: "Step 1", lead: "The map layout: the PNG's lines as a graph (nodes: line ends, corners, T-junctions; edges: lines with length and angle), the printed border, page size and px per inch, every room (id, name, outline polygon, bbox, size in inches; the corridor's legend pattern) and every symbol (id, name, legend ID, referent, description, room or entrance, bbox), all in PNG pixels.", body: ["Rename a room or symbol here and the next run of the same floorplan keeps the name."], inputs: ["paper_locator.ReferenceMap"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     finger_paths: { title: "finger_paths.png", kind: "Saved file", steps: "End of run", lead: "Left trail (red) and right trail (blue) drawn on the PNG.", body: [], inputs: ["finger_tracking.draw_trails (written by run_pipeline)"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
-    data_csv: { title: "data.csv", kind: "Saved file", steps: "Step 26", lead: "Every table of the run in one sheet, side by side: the summary (per room and symbol: visits, times, dimensions in inches; plus the whole map's interaction time), the room order (every visit with entry / exit time), and the corner vectors (4× a second).", body: [], inputs: ["data_export.save_data_files"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    data_csv: { title: "summary.csv, room_order.csv, corner_motion.csv", kind: "Saved files", steps: "Step 26", lead: "One plain table per file: the summary (per room and symbol: visits, times, dimensions in inches; plus the whole map's interaction time), the room order (every visit with entry / exit time), and the corner vectors (4× a second).", body: [], inputs: ["data_export.save_data_files"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     corner_json: { title: "corner_motion.json", kind: "Saved file", steps: "Step 26", lead: "How each paper corner moved, 4× a second: {\"TL\": [[dx, dy], …], \"TR\": …, \"BR\": …, \"BL\": …} in frame pixels since the previous sample; null while the map isn't in the frame.", body: [], inputs: ["data_export.CornerMotion"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     finger_pos: { title: "finger_positions.json", kind: "Saved file", steps: "Step 26", lead: "Every frame: frame number, time, and each index fingertip's position in PNG pixels (null = that hand not seen).", body: [], inputs: ["data_export (from the finger_tracking session log)"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     floorplan: { title: "floorplan.png", kind: "Saved file", steps: "Step 26", lead: "A copy of the floorplan PNG the run used, so the folder is complete on its own.", body: [], inputs: ["data_export.save_data_files"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
-    data_folder: { title: "data/<date_time>__<map>__<video>/", kind: "Run folder", steps: "Every run", lead: "Every run gets its own folder, e.g. data/2026-10-11_13-59-43__distractor_floorplan_E__S-19_Elevator/, holding all 6 files: data.csv, corner_motion.json, finger_positions.json, finger_paths.png, map.json, floorplan.png.", body: ["Use --data-dir to put run folders somewhere else."], inputs: ["run_pipeline.make_run_dir"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    data_folder: { title: "data/<date_time>__<map>__<video>/", kind: "Run folder", steps: "Every run", lead: "Every run gets its own folder, e.g. data/2026-10-11_13-59-43__distractor_floorplan_E__S-19_Elevator/, holding all 8 files: summary.csv, room_order.csv, corner_motion.csv, corner_motion.json, finger_positions.json, finger_paths.png, map.json, floorplan.png.", body: ["Use --data-dir to put run folders somewhere else."], inputs: ["run_pipeline.make_run_dir"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
   };
 
   // ------------------------------------------------------------------ layout
@@ -495,12 +495,12 @@ table.steps tr.hl { background: var(--accent-soft); }
     ["timing", 420, 830, 230, 64, "timing.py", "step 25 · main + room / symbol timers", ""],
     ["units", 185, 950, 170, 56, "units.py", "pixels → inches", ""],
     ["data_export", 420, 945, 230, 64, "data_export.py", "step 26 · CSV + JSON", ""],
-    ["data_csv", 760, 937, 190, 24, "data.csv", "", "output chip"],
+    ["data_csv", 760, 937, 190, 24, "3 CSV tables", "", "output chip"],
     ["corner_json", 760, 965, 190, 24, "corner_motion.json", "", "output chip"],
     ["finger_pos", 760, 993, 190, 24, "finger_positions.json", "", "output chip"],
     ["floorplan", 760, 1021, 190, 24, "floorplan.png", "", "output chip"],
     ["dashboard", 985, 950, 190, 56, "dashboard.py", "standalone · old dashboards", "tool"],
-    ["data_folder", 185, 1095, 990, 80, "data/<date_time>__<map>__<video>/", "data.csv · corner_motion.json · finger_positions.json · finger_paths.png · map.json · floorplan.png", "output"],
+    ["data_folder", 185, 1095, 990, 80, "data/<date_time>__<map>__<video>/", "summary.csv · room_order.csv · corner_motion.csv · corner_motion.json · finger_positions.json · finger_paths.png · map.json · floorplan.png", "output"],
   ];
   // [from, to, points, label, labelX, labelY, anchor, kind]
   const EDGES = [
@@ -668,7 +668,7 @@ table.steps tr.hl { background: var(--accent-soft); }
     ["23", "every frame", "Fingertip → PNG pixels through this frame's homography; on_paper flag.", "finger_tracking"],
     ["24", "every frame", "Keep Left / Right straight (wrist matching + fading MediaPipe-label memory).", "finger_tracking"],
     ["25", "every frame", "Step the timers: the main timer runs while a finger is on the map; rooms / symbols / boxes count visits ≥ 1 s. Corners sampled 4× a second.", "timing"],
-    ["26", "end of run", "Save data.csv, corner_motion.json, finger_positions.json, floorplan.png (and finger_paths.png) into the run folder.", "data_export"],
+    ["26", "end of run", "Save summary.csv, room_order.csv, corner_motion.csv, corner_motion.json, finger_positions.json, floorplan.png (and finger_paths.png) into the run folder.", "data_export"],
   ];
   document.getElementById("stepRows").innerHTML = STEPS.map(([n, when, what, file, removed]) =>
     `<tr data-file="${file}"${removed ? ' class="removed"' : ""}><td class="num">${n}</td><td>${esc(when)}</td><td>${esc(what)}</td>` +
@@ -678,7 +678,7 @@ table.steps tr.hl { background: var(--accent-soft); }
     tr.addEventListener("click", () => { select(tr.dataset.file); document.getElementById("diagram").scrollIntoView({ behavior: "smooth", block: "start" }); });
 
   const OUTS = [
-    ["data_csv", "data_export.py", "Summary (rooms + symbols: visits, times, inches; whole-map time), room order, corner vectors — side by side"],
+    ["data_csv", "data_export.py", "Summary (rooms + symbols: visits, times, inches; whole-map time), room order, corner vectors — one CSV each"],
     ["corner_json", "data_export.py", "Each corner's (dx, dy) 4× a second, one list per corner"],
     ["finger_pos", "data_export.py", "Every frame's index fingertips in PNG pixels"],
     ["finger_paths", "run_pipeline.py (finger_tracking.draw_trails)", "Left (red) and right (blue) trails on the map"],
@@ -723,7 +723,7 @@ table.steps tr.hl { background: var(--accent-soft); }
         <li><b>Find &amp; follow the paper (every frame)</b> — search the whole frame until the map is found, then keep the 4 crop corners locked by lining up the PNG's printed lines with lines traced inside the crop. If the map leaves the frame, drop the crop and search again.</li>
         <li><b>Fingers (every frame)</b> — MediaPipe fingertips mapped onto the PNG, Left/Right kept stable.</li>
         <li><b>Timers (every frame)</b> — the main timer runs while a finger is on the map; every room and symbol has its own enter/exit timer.</li>
-        <li><b>Results (end)</b> — <code>data.csv</code>, <code>corner_motion.json</code>, <code>finger_positions.json</code>, <code>floorplan.png</code>.</li>
+        <li><b>Results (end)</b> — <code>summary.csv</code>, <code>room_order.csv</code>, <code>corner_motion.csv</code>, <code>corner_motion.json</code>, <code>finger_positions.json</code>, <code>floorplan.png</code>.</li>
         <li><b>Run folder</b> — all 6 files saved together.</li>
       </ol>
       <h3>Reading the arrows</h3>

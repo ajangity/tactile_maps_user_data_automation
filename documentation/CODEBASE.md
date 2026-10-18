@@ -105,7 +105,7 @@ The pipeline runs in 8 layers, top to bottom. Layers 4–6 repeat for every vide
    │      ▼ fingertips (PNG px, on_paper)                                │
 6  │ timing.py ◄── RoomMap (room pixels, symbol boxes), extra boxes      │
    └─────────────────────────────────────────────────────────────────────┘
-7 Results         data_export.py ─► data.csv (all tables side by side), corner_motion.json, ...
+7 Results         data_export.py ─► summary.csv, room_order.csv, corner_motion.csv, corner_motion.json, ...
 8 Run folder      all 8 files in data/<date_time>__<map>__<video>/
 ```
 

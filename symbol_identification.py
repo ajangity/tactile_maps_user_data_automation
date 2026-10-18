@@ -7,7 +7,7 @@ edge_tracing.py finds where the symbols are, but only as anonymous marks.
 This file matches each one to the tactile-symbol legend and names it after
 the legend entry -- "Elevator #11", "Toilet #2", "Door / Emergency exit
 #15" -- the names the timers, the on-screen timer list, map.json and
-data.csv all use.
+the CSVs all use.
 
 THE LEGEND lives in legends/: the three legend screenshots
 (symbol_legend_1-3.png) and symbol_legend.json, which lists every entry --

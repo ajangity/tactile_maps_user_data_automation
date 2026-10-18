@@ -1,4 +1,4 @@
-"""This file writes the run's final data files, the combined CSV and
+"""This file writes the run's final data files, the CSV tables and
 corner-motion log among them, into the run folder at the end of a run.
 
 The run's final data files, for analysis outside this project.
@@ -6,27 +6,25 @@ The run's final data files, for analysis outside this project.
 Written at the end of every run (run_pipeline.py calls save_data_files),
 into the run folder next to map.json and finger_paths.png:
 
-  data.csv             every table of the run in one sheet, side by side
-                       with an empty column between them (laid out like the
-                       team's spreadsheet), each starting at the top row:
-                         summary     one row per room (labeled by the symbol
-                                     in it), then one per symbol not used as
-                                     a label, plus the whole map:
-                                       Element/Symbol, Symbol Visits, Symbol Time,
-                                       Room Visits, Room Time, Room Dimension (inches)
-                         room order  every room visit in order, revisits included:
-                                       Order, Time Entered, Time Exited
-                         corners     a few times a second, how far each paper
-                                     corner moved since the previous sample:
-                                       Frame #, Timestamp, Corner Vectors
+  summary.csv          one row per room (labeled by the symbol in it), then
+                       one per symbol not used as a label, plus the whole map:
+                         Element/Symbol, Symbol Visits, Symbol Time (s),
+                         Room Visits, Room Time (s), Room Dimension (in)
+  room_order.csv       every room visit in order, revisits included:
+                         Order, Time Entered (s), Time Exited (s)
+  corner_motion.csv    a few times a second, how far each paper corner moved
+                       since the previous sample (frame pixels):
+                         Frame #, Timestamp (s), TL dx, TL dy, ... BL dx, BL dy
   corner_motion.json   the corner vectors, one list per corner: {"TL": [[dx, dy], ...], ...}
   finger_positions.json  every frame's index fingertips in map (PNG) pixels
   floorplan.png        a copy of the map PNG the run used
 
-Times are video time, written M:SS.ss. Visits follow timing.py's rules (a
-visit is >= 1 s; shorter touches aren't counted). The "Entire map" row's
-Room Time is the main timer: total time at least one index finger was on
-the map (timing.InteractionTimer).
+Each CSV is one plain table (header row, then data), so it opens as-is in
+Google Sheets or Excel. Times are video time in plain seconds (12.34), not
+M:SS.ss, which Sheets misreads as a clock time. Visits follow timing.py's
+rules (a visit is >= 1 s; shorter touches aren't counted). The "Entire
+map" row's Room Time is the main timer: total time at least one index
+finger was on the map (timing.InteractionTimer).
 
 Room labels: a room is named after the free-standing symbol(s) inside it,
 or, failing that, the entrance symbol(s) leading into it, followed by the
@@ -53,6 +51,11 @@ def clock(ms):
         return ""
     minutes, seconds = divmod(ms / 1000.0, 60)
     return f"{int(minutes)}:{seconds:05.2f}"
+
+
+def seconds(ms):
+    """Milliseconds of video time -> seconds, 2 decimals, for the CSVs."""
+    return "" if ms is None else round(ms / 1000.0, 2)
 
 
 # ---------------------------------------------------------------- corner motion
@@ -83,16 +86,15 @@ class CornerMotion:
 
     def to_json(self):
         """{corner name: [[dx, dy] or None per sample]} -- one list per corner,
-        lined up with the corner rows of data.csv."""
+        lined up with the rows of corner_motion.csv."""
         return {name: [None if s["vectors"] is None else list(s["vectors"][i]) for s in self.samples]
                 for i, name in enumerate(CORNER_NAMES)}
 
     def rows(self):
         out = []
         for s in self.samples:
-            vec = "" if s["vectors"] is None else "; ".join(
-                f"{name} ({dx}, {dy})" for name, (dx, dy) in zip(CORNER_NAMES, s["vectors"]))
-            out.append([s["frame"], clock(s["t_ms"]), vec])
+            vec = [""] * 8 if s["vectors"] is None else [d for v in s["vectors"] for d in v]
+            out.append([s["frame"], seconds(s["t_ms"])] + vec)
         return out
 
 
@@ -127,7 +129,7 @@ def _visits_and_time(timers):
 def summary_rows(timing, room_map, inches):
     labels, symbol_ids = room_labels(room_map)
     symbol_timers = {t.symbol["id"]: t for t in timing.symbols}
-    rows = [["Entire map", "", "", "", clock(timing.paper.elapsed_ms()),
+    rows = [["Entire map", "", "", "", seconds(timing.paper.elapsed_ms()),
              f"({inches.width_in:g}, {inches.height_in:g})"]]
     used = set()
     for r in room_map.rooms:
@@ -137,15 +139,15 @@ def summary_rows(timing, room_map, inches):
         used.update(symbol_ids[rid])
         s_visits, s_ms = _visits_and_time(timers)
         w, h = r.get("size_in") or inches.bbox_size(r["bbox"])
-        rows.append([labels[rid], s_visits if timers else "", clock(s_ms) if timers else "",
-                     len(room_timer.visits), clock(sum(v["duration_ms"] for v in room_timer.visits)),
+        rows.append([labels[rid], s_visits if timers else "", seconds(s_ms) if timers else "",
+                     len(room_timer.visits), seconds(sum(v["duration_ms"] for v in room_timer.visits)),
                      f"({w:g}, {h:g})"])
     for sid, t in symbol_timers.items():
         if sid in used:
             continue
         name = t.name + (f" (entrance to {t.room})" if t.entrance and t.room else "")
         s_visits, s_ms = _visits_and_time([t])
-        rows.append([name, s_visits, clock(s_ms), "", "", ""])
+        rows.append([name, s_visits, seconds(s_ms), "", "", ""])
     return rows
 
 
@@ -153,33 +155,16 @@ def order_rows(timing, room_map):
     labels, _ = room_labels(room_map)
     visits = sorted(((v["enter_ms"], v["exit_ms"], labels[rid])
                      for rid, t in timing.rooms.items() for v in t.visits))
-    return [[label, clock(enter), clock(exit_)] for enter, exit_, label in visits]
+    return [[label, seconds(enter), seconds(exit_)] for enter, exit_, label in visits]
 
 
 # ---------------------------------------------------------------- writing
 
-SUMMARY_HEADER = ["Element/Symbol", "Symbol Visits", "Symbol Time", "Room Visits", "Room Time",
-                  "Room Dimension (in)"]
-ORDER_HEADER = ["Order", "Time Entered", "Time Exited"]
-CORNER_HEADER = ["Frame #", "Timestamp", "Corner Vectors"]
-
-
-def side_by_side(tables):
-    """[(header, rows), ...] -> (header, rows) of one sheet: the tables next
-    to each other with an empty column between, shorter ones padded with
-    empty cells."""
-    header, widths = [], []
-    for k, (table_header, _) in enumerate(tables):
-        header += ([""] if k else []) + list(table_header)
-        widths.append(len(table_header))
-    rows = []
-    for i in range(max(len(table_rows) for _, table_rows in tables)):
-        row = []
-        for k, (_, table_rows) in enumerate(tables):
-            cells = list(table_rows[i]) if i < len(table_rows) else []
-            row += ([""] if k else []) + cells + [""] * (widths[k] - len(cells))
-        rows.append(row)
-    return header, rows
+SUMMARY_HEADER = ["Element/Symbol", "Symbol Visits", "Symbol Time (s)", "Room Visits",
+                  "Room Time (s)", "Room Dimension (in)"]
+ORDER_HEADER = ["Order", "Time Entered (s)", "Time Exited (s)"]
+CORNER_HEADER = ["Frame #", "Timestamp (s)"] + [f"{name} {axis}" for name in CORNER_NAMES
+                                                for axis in ("dx", "dy")]
 
 
 def _write_csv(path, header, rows):
@@ -201,10 +186,9 @@ def save_data_files(run_dir, timing, ref, tracker, corner_motion):
     """Write every file listed in the module notes into run_dir. Call after
     timing.finish()."""
     out = lambda name: os.path.join(run_dir, name)
-    _write_csv(out("data.csv"), *side_by_side([
-        (SUMMARY_HEADER, summary_rows(timing, ref.rooms, ref.inches)),
-        (ORDER_HEADER, order_rows(timing, ref.rooms)),
-        (CORNER_HEADER, corner_motion.rows())]))
+    _write_csv(out("summary.csv"), SUMMARY_HEADER, summary_rows(timing, ref.rooms, ref.inches))
+    _write_csv(out("room_order.csv"), ORDER_HEADER, order_rows(timing, ref.rooms))
+    _write_csv(out("corner_motion.csv"), CORNER_HEADER, corner_motion.rows())
     with open(out("corner_motion.json"), "w", encoding="utf-8") as f:
         json.dump(corner_motion.to_json(), f)
     with open(out("finger_positions.json"), "w", encoding="utf-8") as f:

@@ -97,8 +97,8 @@ INSTRUCTIONS = [   # the numbered steps in the "i" panel
     "Use ] / [ to play faster or slower. Every frame is still processed, so results don't "
     "depend on speed. Press c for the full list of keys.",
     "When the video ends, or when you press q, everything is saved to "
-    "data/<date_time>__<map>__<video>/: data.csv, corner_motion.json, "
-    "finger_positions.json, finger_paths.png, map.json and floorplan.png.",
+    "data/<date_time>__<map>__<video>/: summary.csv, room_order.csv, corner_motion.csv, "
+    "corner_motion.json, finger_positions.json, finger_paths.png, map.json and floorplan.png.",
     'Optional: rename rooms or symbols in that map.json (e.g. "Room 3" -> "Office"); the next '
     "run of the same map uses your names. Symbol names come from the legend in legends/.",
 ]
@@ -317,7 +317,7 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
         floorplan.png          the floor plan PNG
         finger_paths.png       left (red) / right (blue) trails on the map
         finger_positions.json  every frame's index fingertips in map pixels
-        data.csv, corner_motion.json
+        summary.csv, room_order.csv, corner_motion.csv, corner_motion.json
                                (see data_export.py)
     """
     for path in (video_path, map_path):
