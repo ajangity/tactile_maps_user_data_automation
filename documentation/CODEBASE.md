@@ -3,7 +3,8 @@
 Technical reference for the tactile-map finger-tracking pipeline: what every file does, how data moves between them, the file formats a run produces, the settings that control behavior, and what has been measured so far.
 
 - **Interactive diagram:** [`architecture.html`](architecture.html). Open it in a browser and click any box.
-- **Narrative walk-through of the 26 pipeline steps:** [`README.md`](README.md).
+- **Reading the output data** (every file and column, how visits are counted, Google Sheets import): [`data/README.md`](../data/README.md). It's written for researchers, not developers.
+- **Which map goes with which video:** [`png_reference_maps/README.md`](../png_reference_maps/README.md).
 
 ---
 
@@ -16,24 +17,35 @@ Given a **video** of someone exploring a printed tactile map and the map's **flo
 3. Works out the map's rooms and symbols automatically from the PNG. It then times every visit to the paper, each room and each symbol; a visit counts if it lasts at least 1 second.
 4. Saves the data files (3 CSVs, corner-motion JSON, map JSON, floorplan PNG, finger-path PNG and JSON) into a per-run folder.
 
+Around the pipeline:
+
+- `loop_pipeline.py` runs it on every video/map pair of the study, one after another.
+- `google_sheets/import_run.gs` imports the run folders into a Google Sheet: one tab per run, with the three CSVs as three tables.
+
 ---
 
 ## 2. Quick start
 
 ```bash
 # from the project folder
-python run_pipeline.py "S-19_Elevator.mp4" distractor_floorplan_E.png              # with a window
-python run_pipeline.py "S-19_Elevator.mp4" distractor_floorplan_E.png --no-display  # batch, no window
-python dashboard.py "data/<run folder>/dashboard.json"                             # rebuild a dashboard
-python edge_tracing.py distractor_floorplan_E.png                                  # inspect line tracing
-python symbol_identification.py distractor_floorplan_E.png                         # inspect symbol names
-python label_symbols.py distractor_floorplan_E.png                                 # optional extra boxes
+python run_pipeline.py mp4_user_data/S-19_Elevator.mp4 png_reference_maps/distractor_floorplan_E.png              # with a window
+python run_pipeline.py mp4_user_data/S-19_Elevator.mp4 png_reference_maps/distractor_floorplan_E.png --no-display  # no window
+python loop_pipeline.py                                                     # every video/map pair, one after another
+python edge_tracing.py png_reference_maps/distractor_floorplan_E.png        # inspect line tracing
+python symbol_identification.py png_reference_maps/distractor_floorplan_E.png   # inspect symbol names
+python units.py png_reference_maps/distractor_floorplan_E.png               # each room's size in inches
+python label_symbols.py png_reference_maps/distractor_floorplan_E.png       # optional extra boxes
+python dashboard.py "data/<run folder>/dashboard.json"                      # rebuild an old run's dashboard
 ```
+
+Videos live in `mp4_user_data/` and maps in `png_reference_maps/`. The videos are too large for git, so copy them in from the lab's Drive.
 
 | Option | Meaning |
 |---|---|
 | `--no-display` | No window; runs start to finish unattended. |
 | `--data-dir PATH` | Where run folders are created. Default: `data/` next to the code. |
+
+**Getting the results into Google Sheets:** see §5, `google_sheets/import_run.gs`, or the step-by-step guide in [`data/README.md`](../data/README.md#1-quick-start-open-the-data-in-google-sheets).
 
 **Keys while the video plays**
 
@@ -60,24 +72,30 @@ python label_symbols.py distractor_floorplan_E.png                              
 
 ```
 tactile_maps_user_data_automation/
-├── run_pipeline.py        entry point
+├── run_pipeline.py        entry point: one video + one map
+├── loop_pipeline.py       runs run_pipeline.py on every video/map pair of the study
 ├── auto_crop.py           crop running order (steps 2–21 each frame)
 ├── paper_locator.py       auto-crop part 1 (steps 1–8)
 ├── corner_fitting.py      auto-crop part 2 (steps 9–17)
 ├── crop_checker.py        checks + backups (steps 14, 18, 19, 21)
 ├── edge_tracing.py        printed-line tracing (PNG + frames)
-├── room_tracking.py       rooms + symbols from the PNG
+├── room_tracking.py       rooms from the PNG
 ├── symbol_identification.py   finds, recognizes and names each symbol
 ├── finger_tracking.py     fingertips (steps 22–24)
 ├── timing.py              enter/exit timers (step 25)
-├── dashboard.py           results JSON + HTML dashboard (step 26)
+├── data_export.py         the run's CSV / JSON data files (step 26)
+├── units.py               map pixels → inches
 ├── manual_crop.py         Space-key corner dragging + video window
 ├── label_symbols.py       optional: hand-drawn extra boxes
+├── dashboard.py           standalone: rebuilds old runs' HTML dashboards
 ├── hand_landmarker.task   MediaPipe model
-├── distractor_floorplan_E.png, S-19_Elevator.mp4   inputs
-├── data/                  one folder per run (created automatically)
-├── documentation/         README.md, CODEBASE.md, architecture.html
-└── old_code/              the pre-refactor version, kept for reference
+├── legends/               symbol legend: 3 screenshots + symbol_legend.json
+├── google_sheets/
+│   └── import_run.gs      Google Apps Script: import run folders into a Sheet
+├── png_reference_maps/    every floorplan PNG + README (video → map matching)
+├── mp4_user_data/         session videos S-<N>_<Referent>.mp4   [not in git: too large]
+├── data/                  one folder per run + README.md (how to read the data)
+└── documentation/         CODEBASE.md, architecture.html
 ```
 
 ---
@@ -107,13 +125,18 @@ The pipeline runs in 8 layers, top to bottom. Layers 4–6 repeat for every vide
    └─────────────────────────────────────────────────────────────────────┘
 7 Results         data_export.py ─► summary.csv, room_order.csv, corner_motion.csv, corner_motion.json, ...
 8 Run folder      all 8 files in data/<date_time>__<map>__<video>/
+                         │
+  Outside a run   loop_pipeline.py ── runs layers 2–8 once per video/map pair
+                  google_sheets/import_run.gs ◄── run folders' CSVs ─► one Sheet tab per run
 ```
 
 **Dependency rules**
 
 - `edge_tracing.py` imports nothing from the crop code. Callers can pass it a region to stay inside: the crop once the map is locked, or nothing before that.
 - `paper_locator.py` (File 1) has no dependency on `corner_fitting.py` (File 2); File 2 imports File 1. `auto_crop.py` imports both, so the running order lives in one place.
-- `run_pipeline.py` is the only file that touches the window, the keyboard, or the run folder.
+- `run_pipeline.py` is the only file that touches the window, the keyboard, or the run folder (`data_export.py` writes into the folder it's handed).
+- `loop_pipeline.py` imports nothing from the pipeline. It starts `run_pipeline.py` as a separate process per pair, so one crashed run doesn't stop the batch.
+- `google_sheets/import_run.gs` only reads the CSVs. Changing it never changes the data format, and changing a CSV's columns needs no change to it, because it takes whatever header each CSV has.
 
 ---
 
@@ -223,7 +246,7 @@ On video frames the wall threshold is 40 px, since the map is smaller in the fra
 | `SymbolTimer`, `SymbolTiming` | `timing.Timing` with symbol timers that also record `symbol`. Entrance symbols get type `"entrance"` and are timed over their `entrance_zone` |
 | CLI `main` | Prints every symbol's name, legend description and match distance, and the corridor's pattern; saves `<map>.symbols.png` |
 
-On map E: 18 symbols (11 free-standing, 7 on walls), all recognized; correct matches score 0.0–1.0 px and the nearest wrong template ≥ 1.03 px. To add a shape, add a drawing to `TEMPLATES` and a name to `LEGEND`.
+On map E: 20 symbols (10 free-standing, 10 on walls, doorway gaps included), all matched to a legend entry; correct matches score 0.0–1.0 px and the nearest wrong template ≥ 1.03 px. To add a shape, add its drawing to a legend screenshot in `legends/` and an entry (ID, referent, description, placement, `box`) to `legends/symbol_legend.json`. No shape is hard-coded.
 
 ### `finger_tracking.py`: steps 22–24
 
@@ -243,6 +266,55 @@ On map E: 18 symbols (11 free-standing, 7 on walls), all recognized; correct mat
 | Status | `visited` (≥ 1 visit), `brushed` (touched, no visit), `missed` (never touched) |
 | `sequence()` | Every visit in time order: the path through the rooms |
 | `load_manual_boxes` | Reads `<map>.symbols.json`; files without `"space": "png"` are rotated back from the old 180° convention |
+
+### `data_export.py`: step 26
+
+Called once at the end of a run by `run_pipeline.py`, after `timing.finish()`. Every CSV is one plain table (header row, then data), so it opens directly in Sheets or Excel. Times are plain seconds (`12.34`), because Sheets reads `M:SS.ss` as a time of day. The column-by-column meaning, written for researchers, is in [`data/README.md`](../data/README.md#4-file-by-file).
+
+| Function | What it does |
+|---|---|
+| `save_data_files(run_dir, timing, ref, tracker, corner_motion)` | Writes `summary.csv`, `room_order.csv`, `corner_motion.csv`, `corner_motion.json`, `finger_positions.json` and copies the PNG to `floorplan.png` |
+| `summary_rows` | `Entire map` row (Room Time = `InteractionTimer`), then one row per room, then one per symbol not used as a room label (mostly entrances) |
+| `order_rows` | Every room visit sorted by entry time, revisits included |
+| `room_labels(room_map)` | `"<symbol(s)> (<room name>)"`: free-standing symbols inside the room, else entrance symbols leading in, else the corridor pattern. Shared with the live timer list (`t`) |
+| `CornerMotion.update / rows / to_json` | Samples the 4 crop corners `CORNER_SAMPLES_PER_SECOND` times a second; stores each corner's whole-pixel `(dx, dy)` since the previous sample; `None` while the map is out of the frame and for the first sample after it returns |
+| `finger_positions(tracker)` | One record per frame from `FingerTracker.session_log`: `frame`, `t_ms`, `Left`/`Right` as `[map_x, map_y]` or `null` |
+| `seconds(ms)` / `clock(ms)` | Seconds with 2 decimals, for the CSVs / `M:SS.ss`, for the live window only |
+
+### `units.py`: pixels → inches
+
+Every map is printed on US Letter, so the PNG's long side is 11 in and its short side 8.5 in; one scale per axis converts any PNG distance. That's exactly 96 px/in for the 816 × 1056 floorplans. `PixelsToInches(w, h)` provides `point`, `size` and `bbox_size`. It's used by `paper_locator` (each room's `size_in`, plus `page_in` and `px_per_inch` in `map.json`) and by `data_export` (*Room Dimension (in)*). `python units.py map.png` prints each room's size.
+
+### `loop_pipeline.py`: batch runner
+
+Runs `run_pipeline.py` (with a window) on every pair in its `PAIRS` list, one after another, each as its own process. The list holds all 180 sessions: 20 participants × 9 referents.
+
+| Item | Detail |
+|---|---|
+| `PAIRS` | `(video, map)` file names. The map for `S-<N>_<Referent>.mp4` is the symbol participant N chose for that referent (Results sheet, column B) → `distractor_floorplan_<symbol>.png`. Special cases and open assumptions are listed in the file's header comment and in `png_reference_maps/README.md`. |
+| Missing files | A pair whose video or map isn't on disk is skipped and listed at the end, so the batch can run while videos are still downloading |
+| Failures | A run that exits with an error is listed at the end; the batch continues |
+| Ctrl+C | Stops the batch; the run in progress isn't saved (only its `map.json` exists) |
+
+Re-running creates new run folders next to the old ones; nothing is overwritten.
+
+### `google_sheets/import_run.gs`: Google Sheets importer
+
+A Google Apps Script pasted into a Sheet (**Extensions → Apps Script**). It adds a **Tactile Maps → Import run CSVs...** menu. The dialog takes the whole `data/` folder, one run folder, or loose CSV files, and makes **one tab per run**, named `<map> - <video>`. The run's `summary.csv`, `room_order.csv` and `corner_motion.csv` are laid side by side on that tab (columns A–F, H–J, L–U), each converted to a Google Sheets **table**. It doesn't change the CSVs or add columns; the tab name says which run it is.
+
+| Function | What it does |
+|---|---|
+| `onOpen`, `showImportDialog` | The menu and the file-picker dialog (`DIALOG_HTML`) |
+| dialog script | Groups the picked CSVs by the folder they're in (= run), skips runs with only an old-format `data.csv`, reads the files, and calls `importRun` **once per run**, oldest first. This keeps each call far below Apps Script's 6-minute limit, and the newest run of a map + video wins its tab. Shows progress and a final report. |
+| `importRun(run, files)` | Fresh tab in the old tab's place (or in name order), writes each CSV with `toValues` (numbers as numbers, text columns formatted as plain text so `"(8.5, 11)"` isn't reinterpreted), then `makeTables` |
+| `makeTables` | One `addTable` request per CSV through the **Google Sheets API advanced service**, which must be added under **Services** in the Apps Script editor. Without it, or if the API refuses, the ranges are striped instead and the dialog shows the reason. |
+| `finishImport` | Deletes the blank `Sheet1` a new spreadsheet starts with |
+| `tabLabel`, `apiName` | `<date_time>__<map>__<video>` → `"<map> - <video>"`; table names like `Summary_distractor_floorplan_E_S_19_Elevator` |
+
+Pitfalls found while building it:
+
+- The dialog's status line must not be a global named `status`. That's `window.status`, which only holds strings, so every message would silently vanish.
+- `PERMISSION_DENIED ... reading from storage` means several Google accounts are signed in. `google.script.run` uses the browser's default account; use a window signed in to one account.
 
 ### `dashboard.py`: not called by a run (rebuilds dashboards from older runs' `dashboard.json`)
 
@@ -266,7 +338,34 @@ Press `s`/`r` to start a symbol or room box, click two corners, type a name, the
 
 ## 6. Data formats
 
-All map coordinates are the **PNG's own pixels, in the PNG's own orientation** (`(0, 0)` = top-left). Frame coordinates are video pixels.
+All map coordinates are the **PNG's own pixels, in the PNG's own orientation** (`(0, 0)` = top-left). Frame coordinates are video pixels. Times are video time: seconds in the CSVs, milliseconds (`t_ms`) in the JSON.
+
+The researcher-facing description of every file a run saves is [`data/README.md`](../data/README.md). This section is the compact developer version.
+
+### The run folder
+
+`data/<YYYY-MM-DD_HH-MM-SS>__<map stem>__<video stem>/`, with the processing time first so folders sort chronologically. `map.json` is written at the start; everything else at the end. A folder holding only `map.json` is a run in progress, or one that crashed or was interrupted.
+
+### The three CSVs (`data_export.py`)
+
+```
+summary.csv        Element/Symbol, Symbol Visits, Symbol Time (s), Room Visits, Room Time (s), Room Dimension (in)
+room_order.csv     Order, Time Entered (s), Time Exited (s)
+corner_motion.csv  Frame #, Timestamp (s), TL dx, TL dy, TR dx, TR dy, BR dx, BR dy, BL dx, BL dy
+```
+
+- **`summary.csv` rows:** `Entire map` (Room Time = the main timer; dimension = the sheet), then one row per room labeled `"<symbol> (<room>)"`, then one row per symbol not used as a label. Columns that don't apply to a row are blank, not 0.
+- **`room_order.csv`:** room visits only (≥ 1 s), sorted by entry time. Rows can overlap in time when the two hands are in different rooms.
+- **`corner_motion.csv`:** blank vector cells mean the map wasn't in the frame, or it's the first sample after the map came back.
+
+Before the October 2026 split, runs wrote a single `data.csv` holding all three tables side by side, with times as `M:SS.ss` and the corners in one cell. The Sheets importer skips those runs.
+
+### `finger_positions.json` / `corner_motion.json`
+
+```jsonc
+[{"frame": 1501, "t_ms": 50083, "Left": [664.0, 445.4], "Right": null}, ...]   // one record per frame, map px
+{"TL": [null, [0, -2], [0, 0], ...], "TR": [...], "BR": [...], "BL": [...]}       // one [dx, dy] per corner_motion.csv row
+```
 
 ### `map.json`
 
@@ -437,7 +536,10 @@ On map E this finds 11 rooms (10 rooms + the corridor). The sealing width it pic
 ## 10. Known limitations
 
 - **Skin can pass as paper.** For this participant, pale skin passes the paper filter, so blob outlines grow up the arm. The crop then relies on printed lines (ICP, outline check) when hands cover the page.
-- **Tuned on one video and one map.** A map without symbols, very different line weights, or a different camera setup may need the score thresholds adjusted.
+- **Tuned on one video and one map.** A map without symbols, very different line weights, or a different camera setup may need the score thresholds adjusted. Check each batch run's `finger_paths.png`.
+- **Video → map pairs include assumptions.** `loop_pipeline.PAIRS` guesses which file was shown for P29 (`P29` vs `doors_P29`), A9 (`A9` vs `corridor_A9`) and A11 (`A11` vs `A11_staggered`). Confirm with the Results sheet before relying on those runs.
+- **Interrupted runs aren't saved.** Only `q` saves early; Ctrl+C or a crash leaves just `map.json`.
+- **Symbol first-touch time isn't in the CSVs.** Only room visits are listed in order. Time to first touch a symbol has to be computed from `finger_positions.json` and the symbol's `bbox` / `entrance_zone` in `map.json`.
 - **Speed.** Processing runs at ~6 fps; the first 21 s of S-19 stutter in display mode because of whole-frame searches every 10 frames.
 - **Display mode** was checked with a screenshot harness, not driven on a real screen.
 - **Auto-generated names.** Rooms are named `Room N` in reading order; rename them in `map.json`.
@@ -447,7 +549,7 @@ On map E this finds 11 rooms (10 rooms + the corridor). The sealing width it pic
 
 ## 11. History: from the old code to the new modules
 
-The pre-refactor files are kept in `old_code/`:
+The pre-refactor files (formerly in `old_code/`, no longer in the repo; see git history) map onto today's modules like this:
 
 | Old | New |
 |---|---|
@@ -463,6 +565,13 @@ The pre-refactor files are kept in `old_code/`:
 - **New:** traced-line refinement, outline check, shift search, and automatic rooms and symbols.
 - **Restored from the old code:** page-restricted edge tracing and its `w` overlay labels; the ink-border fallback; the SIFT backup's area-ratio check; SIFT diagnostics in the status bar; the 85% recovery tie-break; transparent-PNG loading; labels on every box; the per-box console summary; the per-symbol CLI listing.
 
+**Since the refactor**
+
+- Symbols are named from the `legends/` legend (`"Elevator #11"`) instead of by rough shape.
+- The HTML dashboard was replaced as the main output by plain data files (`data_export.py`). The single `data.csv` was then split into `summary.csv`, `room_order.csv` and `corner_motion.csv`, with times in plain seconds and one column per corner axis, so each opens directly in Sheets.
+- Inputs moved to `png_reference_maps/` and `mp4_user_data/`; `loop_pipeline.py` runs the whole study.
+- `google_sheets/import_run.gs` imports run folders into a Sheet, one tab per run with three tables.
+
 ---
 
 ## 12. Troubleshooting
@@ -472,5 +581,11 @@ The pre-refactor files are kept in `old_code/`:
 | `FileNotFoundError ... map.json` / `index.lock` at startup | Windows Controlled Folder Access is blocking `python.exe` or `git.exe` (§2) |
 | "Looking for the map…" for a long time | The map isn't face-up, or is mostly covered. Press Space to place the corners by hand. |
 | Crop outline on the wrong sheet or in the wrong place | Press Space, drag the corners, then Space again. Check that the cyan lines sit on the printed lines. |
-| Rooms look wrong | Open `rooms.png` in the run folder. Doorway sealing is automatic; `detect_rooms(walls, gap=…)` can override it. |
+| Rooms look wrong | Press `f` during a run to see the room outlines on the video, or check `rooms` in the run's `map.json` (and `python units.py <map>.png` for their sizes). Doorway sealing is automatic; `detect_rooms(walls, gap=…)` can override it. |
+| A symbol has the wrong name | `python symbol_identification.py <map>.png` lists every symbol's legend match and distance and saves `<map>.symbols.png`. Matches near 1.5 px are borderline. |
 | Only one hand detected | Lighting or motion blur; the crop is upscaled up to 2.5× already |
+| `File not found: ...` at start | Pass paths including the folder: `mp4_user_data/<video>.mp4`, `png_reference_maps/<map>.png` |
+| Run folder has only `map.json` | The run is still going, or it crashed / was stopped with Ctrl+C. Only `q` saves early. |
+| Sheets: Import does nothing / shows nothing | An old copy of `import_run.gs`. Paste the current file again, save, refresh the sheet. |
+| Sheets: `PERMISSION_DENIED ... reading from storage` | More than one Google account signed in. Use an Incognito window with only the sheet owner's account. |
+| Sheets: "Tables were not created ... because ..." | The reason is in the message. Usually the Google Sheets API service isn't added: Apps Script editor → Services → + → Google Sheets API → Add → save. |

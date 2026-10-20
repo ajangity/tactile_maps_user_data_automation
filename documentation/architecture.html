@@ -131,12 +131,12 @@ table.steps tr.hl { background: var(--accent-soft); }
   <p class="sub">How the codebase turns a session video and a floorplan PNG into room-by-room timing data. The diagram reads top to bottom in the order the pipeline runs. <b>Click any box</b> to see what that file does, its inputs and outputs, its key functions and settings, and what it talks to. Arrows into a box are its inputs; arrows out are its outputs.</p>
 
   <section class="facts" aria-label="Key facts">
-    <div class="card fact"><div class="label">Code files</div><div class="value">15</div><div class="note">13 pipeline modules + 2 standalone tools</div></div>
+    <div class="card fact"><div class="label">Code files</div><div class="value">17</div><div class="note">13 pipeline modules + 4 tools (batch runner, Sheets importer, 2 others)</div></div>
     <div class="card fact"><div class="label">Pipeline steps</div><div class="value">26</div><div class="note">steps 5 and 11 removed in the refactor</div></div>
-    <div class="card fact"><div class="label">Files saved per run</div><div class="value">6</div><div class="note">all in data/&lt;date_time&gt;__&lt;map&gt;__&lt;video&gt;/</div></div>
+    <div class="card fact"><div class="label">Files saved per run</div><div class="value">8</div><div class="note">all in data/&lt;date_time&gt;__&lt;map&gt;__&lt;video&gt;/ — see data/README.md</div></div>
     <div class="card fact"><div class="label">Symbol legend</div><div class="value">32</div><div class="note">entries; map E: 20 of 20 symbols matched</div></div>
     <div class="card fact"><div class="label">Map found (S-19)</div><div class="value">21.0 s</div><div class="note">lost at 106.8 s when the sheet leaves the frame</div></div>
-    <div class="card fact"><div class="label">Time on the map (S-19)</div><div class="value">1:14.41</div><div class="note">main timer: a finger on the map</div></div>
+    <div class="card fact"><div class="label">Time on the map (S-19)</div><div class="value">74.41 s</div><div class="note">main timer: a finger on the map</div></div>
   </section>
 
   <div class="layout">
@@ -153,7 +153,7 @@ table.steps tr.hl { background: var(--accent-soft); }
       <figure style="margin:0">
         <div class="diagram-wrap">
           <svg id="diagram" viewBox="0 0 1210 1205" role="img"
-               aria-label="Layered architecture: inputs (floorplan PNG, symbol legend, video, hand model) feed run_pipeline.py, which builds the reference map once (paper_locator with edge_tracing, room_tracking and symbol_identification), then every frame runs auto_crop (with paper_locator, corner_fitting, crop_checker, edge_tracing, manual_crop), finger_tracking and timing, and finally data_export.py writes summary.csv, room_order.csv, corner_motion.csv and the JSON files into the run folder."></svg>
+               aria-label="Layered architecture: inputs (floorplan PNG, symbol legend, video, hand model) feed run_pipeline.py (run once per video/map pair by loop_pipeline.py), which builds the reference map once (paper_locator with edge_tracing, room_tracking and symbol_identification), then every frame runs auto_crop (with paper_locator, corner_fitting, crop_checker, edge_tracing, manual_crop), finger_tracking and timing, and finally data_export.py writes summary.csv, room_order.csv, corner_motion.csv and the JSON files into the run folder, which google_sheets/import_run.gs imports into Google Sheets."></svg>
         </div>
         <figcaption class="hint" style="margin-top:8px">Layers 4–6 (inside the orange dashed frame) run once for every video frame. Each green chip is a file the run saves into its <code>data/</code> folder, drawn next to the code that produces it.</figcaption>
       </figure>
@@ -206,8 +206,8 @@ table.steps tr.hl { background: var(--accent-soft); }
         "Live window (display mode): the crop (green outline, labeled corners, the PNG's printed lines in cyan where the crop places them), fingertip dots, and a status bar with the main map-interaction timer (running / paused). Three panels open from small boxes along the top: i = numbered instructions for using the script (top left, below any banner), t = every timer live, labeled by its legend symbol and green while running, c = the list of keys (both top right).",
         "End of run (video ends or q): closes any open visit, draws finger_paths.png, then calls data_export.save_data_files for summary.csv, room_order.csv, corner_motion.csv, corner_motion.json, finger_positions.json and floorplan.png. Prints the total time on the map.",
       ],
-      inputs: ["Video path (any OpenCV-readable video)", "Map PNG path", "--data-dir (default: data/ next to the code)", "--no-display (batch mode, no window)"],
-      outputs: ["The run folder and all 6 files in it (most written through data_export.py)", "Live 'Video Tracker' window (display mode)", "Console progress"],
+      inputs: ["Video path, e.g. mp4_user_data/S-19_Elevator.mp4 (any OpenCV-readable video)", "Map PNG path, e.g. png_reference_maps/distractor_floorplan_E.png", "--data-dir (default: data/ next to the code)", "--no-display (no window)"],
+      outputs: ["The run folder and all 8 files in it (most written through data_export.py)", "Live 'Video Tracker' window (display mode)", "Console progress"],
       funcs: [
         ["run(video, map, data_dir, display)", "The whole run, start to finish. Returns the run folder."],
         ["make_run_dir(map, video)", "Creates the date/time + map + video named folder."],
@@ -218,7 +218,7 @@ table.steps tr.hl { background: var(--accent-soft); }
       ],
       settings: [["DEFAULT_PLAYBACK_SPEED", "1.5×", "Display speed only"], ["DATA_DIR", "data/", "Where run folders go"]],
       calls: ["paper_locator", "auto_crop", "finger_tracking", "symbol_identification", "timing", "data_export", "manual_crop", "edge_tracing"],
-      calledBy: [],
+      calledBy: ["loop_pipeline"],
       notes: ["Windows Controlled Folder Access must allow python.exe, or creating the run folder fails with a misleading 'No such file or directory'."],
     },
     paper_locator: {
@@ -409,10 +409,12 @@ table.steps tr.hl { background: var(--accent-soft); }
       title: "data_export.py", kind: "Results", steps: "Step 26",
       lead: "Writes the run's data files for analysis: summary.csv, room_order.csv and corner_motion.csv (one plain table each, so they open in Google Sheets), corner_motion.json, finger_positions.json and a copy of the floorplan PNG.",
       body: [
-        "summary.csv: one row per room, labeled by its legend symbol (\"Stairs #5 (Room 1)\", the corridor \"Corridor #28 (Room 6)\"): Symbol Visits, Symbol Time, Room Visits, Room Time, Room Dimension (inches, from units.py). Then a row per entrance symbol (\"Door / Emergency exit #15 (entrance to Room 4)\"), and an 'Entire map' row whose Room Time is the main timer.",
-        "room_order.csv: every room visit in order, revisits included, with Time Entered / Time Exited. corner_motion.csv: CornerMotion samples the 4 crop corners 4× a second and records how far each moved (dx, dy in frame pixels) since the previous sample; blank while the map isn't in the frame.",
-        "corner_motion.json is the same vectors, one list per corner: {\"TL\": [[dx, dy], …], \"TR\": …, \"BR\": …, \"BL\": …}, lined up with table 3's rows (null = map not in the frame). finger_positions.json: every frame's time and each index fingertip in PNG pixels.",
-        "Times are video time in plain seconds (M:SS.ss is read as a clock time by Google Sheets).",
+        "summary.csv: first an 'Entire map' row whose Room Time is the main timer, then one row per room, labeled by its legend symbol (\"Stairs #5 (Room 1)\", the corridor \"Corridor #28 (Room 6)\"): Symbol Visits, Symbol Time (s), Room Visits, Room Time (s), Room Dimension (in) (from units.py). Then a row per symbol not used as a room label, mostly entrances (\"Door / Emergency exit #15 (entrance to Room 4)\"). Columns that don't apply are blank, not 0.",
+        "room_order.csv: Order, Time Entered (s), Time Exited (s): every room visit sorted by entry time, revisits included. Rows can overlap when the two hands are in different rooms.",
+        "corner_motion.csv: Frame #, Timestamp (s), then TL / TR / BR / BL dx and dy, one column each. CornerMotion samples the 4 crop corners 4× a second and records how far each moved in frame pixels since the previous sample; blank while the map isn't in the frame.",
+        "corner_motion.json is the same vectors, one list per corner: {\"TL\": [[dx, dy], …], \"TR\": …, \"BR\": …, \"BL\": …}, lined up with corner_motion.csv's rows (null = blank). finger_positions.json: every frame's time and each index fingertip in PNG pixels.",
+        "Each CSV is one plain table with a header row. Times are video time in plain seconds (M:SS.ss is read as a clock time by Google Sheets). Before the split, a run wrote all three tables side by side into one data.csv.",
+        "What every column means, for the people analyzing the data: data/README.md.",
       ],
       inputs: ["Timing (finished)", "ReferenceMap (rooms, symbols, inches)", "FingerTracker session log", "CornerMotion (fed every frame by run_pipeline)"],
       outputs: ["summary.csv", "room_order.csv", "corner_motion.csv", "corner_motion.json", "finger_positions.json", "floorplan.png"],
@@ -430,6 +432,32 @@ table.steps tr.hl { background: var(--accent-soft); }
       settings: [["PAGE_INCHES", "8.5 × 11", "Physical sheet size"]],
       calls: [], calledBy: ["paper_locator", "data_export"], notes: [],
     },
+    loop_pipeline: {
+      title: "loop_pipeline.py", kind: "Batch runner", steps: "Runs layers 2–8 per pair",
+      lead: "Runs run_pipeline.py on every session of the study, one after another: all 180 video/map pairs (20 participants × 9 referents).",
+      body: [
+        "PAIRS maps each video S-<N>_<Referent>.mp4 in mp4_user_data/ to the floorplan participant N chose for that referent (Results sheet, column B) in png_reference_maps/. Special cases and open assumptions (P29, A9, A11) are in the file's header and png_reference_maps/README.md.",
+        "Each run is its own process, so a crash doesn't stop the batch. Pairs whose video isn't downloaded yet are skipped. At the end it prints how many ran, were skipped and failed. Ctrl+C stops the batch; the run in progress isn't saved.",
+      ],
+      inputs: ["mp4_user_data/*.mp4", "png_reference_maps/*.png"], outputs: ["One run folder per pair in data/", "Console: ran / skipped / failed"],
+      funcs: [["main()", "Loop over PAIRS, run each, report."], ["PAIRS", "The 180 (video, map) pairs."]],
+      settings: [["VIDEO_DIR", "mp4_user_data", "Where videos are read"], ["MAP_DIR", "png_reference_maps", "Where maps are read"]],
+      calls: ["run_pipeline"], calledBy: [], notes: ["Run with: python loop_pipeline.py"],
+    },
+    google_sheets: {
+      title: "google_sheets/import_run.gs", kind: "Google Apps Script", steps: "After runs",
+      lead: "Imports run folders into a Google Sheet: one tab per run, named \"<map> - <video>\", with summary.csv, room_order.csv and corner_motion.csv side by side (columns A–F, H–J, L–U), each converted to a Google Sheets table.",
+      body: [
+        "Setup, once per spreadsheet: Extensions → Apps Script, paste the file, save; Services → + → Google Sheets API → Add (needed for real tables); refresh the sheet. Then Tactile Maps → Import run CSVs... and pick the whole data/ folder, one run folder, or loose CSVs.",
+        "The dialog groups the CSVs by run folder and calls importRun once per run, oldest first. Each call stays far below Apps Script's 6-minute limit, and the newest run of a map + video keeps its tab. Re-importing replaces a run's tab; other tabs are untouched. Old runs with only data.csv are skipped and listed.",
+        "Numbers are written as numbers; text columns are formatted as plain text so \"(8.5, 11)\" stays as is. The CSV format is never changed.",
+      ],
+      inputs: ["Run folders' summary.csv, room_order.csv, corner_motion.csv"], outputs: ["One Sheet tab per run with 3 tables"],
+      funcs: [["importRun(run, files)", "One run → one fresh tab with its tables."], ["makeTables", "addTable through the Sheets API; stripes the ranges and reports why if it can't."], ["finishImport()", "Removes the empty Sheet1."], ["tabLabel / apiName", "Tab and table names."]],
+      settings: [["TABLES", "summary, room_order, corner_motion", "Left-to-right table order"], ["GAP_COLUMNS", "1", "Empty columns between tables"]],
+      calls: [], calledBy: [],
+      notes: ["PERMISSION_DENIED on import = several Google accounts signed in; use a window with one account.", "Step-by-step guide for researchers: data/README.md."],
+    },
     dashboard: {
       title: "dashboard.py", kind: "Standalone tool", steps: "Not part of a run",
       lead: "Rebuilds the older interactive HTML dashboard from a saved dashboard.json. Runs no longer write dashboard.json; this stays for earlier runs' folders.",
@@ -446,10 +474,10 @@ table.steps tr.hl { background: var(--accent-soft); }
         "Saves <map>.symbols.json next to the PNG; each box gets its own timer.",
       ],
       inputs: ["Map PNG", "Mouse + keys"], outputs: ["<map>.symbols.json"],
-      funcs: [], settings: [], calls: [], calledBy: [], notes: ["Run with: python label_symbols.py distractor_floorplan_E.png"],
+      funcs: [], settings: [], calls: [], calledBy: [], notes: ["Run with: python label_symbols.py png_reference_maps/distractor_floorplan_E.png"],
     },
-    png: { title: "<floorplan>.png", kind: "Input", steps: "Read in step 1", lead: "The floorplan map, e.g. distractor_floorplan_E.png. Any PNG works (transparent and grayscale too). It is the whole printed sheet, and its own pixel coordinates are the coordinate system for everything: rooms, symbols, fingertips, paths.", body: ["Edge tracing reads its walls, symbols and dots; room tracking finds its rooms; symbol identification matches its symbols to the legend; the scoring rubric and refinement compare video frames against it."], inputs: [], outputs: ["Read by run_pipeline → paper_locator.ReferenceMap"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
-    mp4: { title: "<session>.mp4", kind: "Input", steps: "Read every frame", lead: "The session video, e.g. S-19_Elevator.mp4: 1920×1080, 29.97 fps, 1:52.6 long; the map is face-up from 21 s to 106.8 s, next to a reference sheet.", body: ["Any video OpenCV can read works. Every frame is processed, whatever the display speed."], inputs: [], outputs: ["Frames → run_pipeline"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    png: { title: "<floorplan>.png", kind: "Input", steps: "Read in step 1", lead: "The floorplan map, from png_reference_maps/ (e.g. distractor_floorplan_E.png; which map goes with which video is in that folder's README). Any PNG works (transparent and grayscale too). It is the whole printed sheet, and its own pixel coordinates are the coordinate system for everything: rooms, symbols, fingertips, paths.", body: ["Edge tracing reads its walls, symbols and dots; room tracking finds its rooms; symbol identification matches its symbols to the legend; the scoring rubric and refinement compare video frames against it."], inputs: [], outputs: ["Read by run_pipeline → paper_locator.ReferenceMap"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    mp4: { title: "<session>.mp4", kind: "Input", steps: "Read every frame", lead: "The session video, from mp4_user_data/ (S-<participant>_<referent>.mp4; not in git). E.g. S-19_Elevator.mp4: 1920×1080, 29.97 fps, 1:52.6 long; the map is face-up from 21 s to 106.8 s, next to a reference sheet.", body: ["Any video OpenCV can read works. Every frame is processed, whatever the display speed."], inputs: [], outputs: ["Frames → run_pipeline"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     task: { title: "hand_landmarker.task", kind: "Input", steps: "Used in step 22", lead: "MediaPipe's hand landmark model file. Must sit in the project folder.", body: ["Loaded once by finger_tracking.create_hand_landmarker in VIDEO mode for up to 2 hands."], inputs: [], outputs: ["Hand landmarks → finger_tracking"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     symbols_json: { title: "<map>.symbols.json", kind: "Optional input", steps: "Read in step 25", lead: "Extra hand-drawn boxes from label_symbols.py, next to the PNG. Each becomes a timer.", body: [], inputs: ["Written by label_symbols.py"], outputs: ["Read by timing.load_manual_boxes"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     map_json: { title: "map.json", kind: "Saved file", steps: "Step 1", lead: "The map layout: the PNG's lines as a graph (nodes: line ends, corners, T-junctions; edges: lines with length and angle), the printed border, page size and px per inch, every room (id, name, outline polygon, bbox, size in inches; the corridor's legend pattern) and every symbol (id, name, legend ID, referent, description, room or entrance, bbox), all in PNG pixels.", body: ["Rename a room or symbol here and the next run of the same floorplan keeps the name."], inputs: ["paper_locator.ReferenceMap"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
@@ -458,7 +486,7 @@ table.steps tr.hl { background: var(--accent-soft); }
     corner_json: { title: "corner_motion.json", kind: "Saved file", steps: "Step 26", lead: "How each paper corner moved, 4× a second: {\"TL\": [[dx, dy], …], \"TR\": …, \"BR\": …, \"BL\": …} in frame pixels since the previous sample; null while the map isn't in the frame.", body: [], inputs: ["data_export.CornerMotion"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     finger_pos: { title: "finger_positions.json", kind: "Saved file", steps: "Step 26", lead: "Every frame: frame number, time, and each index fingertip's position in PNG pixels (null = that hand not seen).", body: [], inputs: ["data_export (from the finger_tracking session log)"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
     floorplan: { title: "floorplan.png", kind: "Saved file", steps: "Step 26", lead: "A copy of the floorplan PNG the run used, so the folder is complete on its own.", body: [], inputs: ["data_export.save_data_files"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
-    data_folder: { title: "data/<date_time>__<map>__<video>/", kind: "Run folder", steps: "Every run", lead: "Every run gets its own folder, e.g. data/2026-10-11_13-59-43__distractor_floorplan_E__S-19_Elevator/, holding all 8 files: summary.csv, room_order.csv, corner_motion.csv, corner_motion.json, finger_positions.json, finger_paths.png, map.json, floorplan.png.", body: ["Use --data-dir to put run folders somewhere else."], inputs: ["run_pipeline.make_run_dir"], outputs: [], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
+    data_folder: { title: "data/<date_time>__<map>__<video>/", kind: "Run folder", steps: "Every run", lead: "Every run gets its own folder, e.g. data/2026-10-11_13-59-43__distractor_floorplan_E__S-19_Elevator/, holding all 8 files: summary.csv, room_order.csv, corner_motion.csv, corner_motion.json, finger_positions.json, finger_paths.png, map.json, floorplan.png.", body: ["map.json is written at the start, everything else at the end; a folder with only map.json is a run in progress or one that was interrupted. Re-running a video makes a new folder and never overwrites.", "data/README.md explains every file and column for the people analyzing the data. Use --data-dir to put run folders somewhere else."], inputs: ["run_pipeline.make_run_dir"], outputs: ["Read by google_sheets/import_run.gs"], funcs: [], settings: [], calls: [], calledBy: [], notes: [] },
   };
 
   // ------------------------------------------------------------------ layout
@@ -480,6 +508,7 @@ table.steps tr.hl { background: var(--accent-soft); }
     ["mp4", 580, 40, 190, 62, "<session>.mp4", "session video", "input"],
     ["legends", 785, 40, 190, 62, "legends/", "symbol legend · 3 PNGs + JSON", "input"],
     ["task", 990, 40, 185, 62, "hand_landmarker.task", "MediaPipe hand model", "input"],
+    ["loop_pipeline", 185, 165, 180, 62, "loop_pipeline.py", "batch · every video/map", "tool"],
     ["run_pipeline", 400, 165, 380, 62, "run_pipeline.py", "entry point · frame loop · live window", ""],
     ["edge_tracing", 185, 275, 170, 64, "edge_tracing.py", "finds printed lines", ""],
     ["paper_locator", 420, 275, 230, 64, "paper_locator.py", "auto-crop part 1 · steps 1–8", ""],
@@ -500,10 +529,13 @@ table.steps tr.hl { background: var(--accent-soft); }
     ["finger_pos", 760, 993, 190, 24, "finger_positions.json", "", "output chip"],
     ["floorplan", 760, 1021, 190, 24, "floorplan.png", "", "output chip"],
     ["dashboard", 985, 950, 190, 56, "dashboard.py", "standalone · old dashboards", "tool"],
-    ["data_folder", 185, 1095, 990, 80, "data/<date_time>__<map>__<video>/", "summary.csv · room_order.csv · corner_motion.csv · corner_motion.json · finger_positions.json · finger_paths.png · map.json · floorplan.png", "output"],
+    ["data_folder", 185, 1095, 760, 80, "data/<date_time>__<map>__<video>/", "3 CSVs · corner_motion.json · finger_positions.json · finger_paths.png · map.json · floorplan.png", "output"],
+    ["google_sheets", 985, 1100, 190, 70, "import_run.gs", "Google Sheets · tab per run", "tool"],
   ];
   // [from, to, points, label, labelX, labelY, anchor, kind]
   const EDGES = [
+    ["loop_pipeline", "run_pipeline", [[365, 196], [400, 196]], "", 0, 0, "", "call"],
+    ["data_folder", "google_sheets", [[945, 1135], [985, 1135]], "CSVs", 965, 1128, "middle", "data"],
     ["png", "run_pipeline", [[470, 102], [470, 165]], "map path", 476, 138, "start", "data"],
     ["mp4", "run_pipeline", [[675, 102], [675, 165]], "video frames", 681, 138, "start", "data"],
     ["legends", "symbol_identification", [[880, 102], [880, 275]], "templates + names", 886, 190, "start", "data"],
@@ -724,8 +756,10 @@ table.steps tr.hl { background: var(--accent-soft); }
         <li><b>Fingers (every frame)</b> — MediaPipe fingertips mapped onto the PNG, Left/Right kept stable.</li>
         <li><b>Timers (every frame)</b> — the main timer runs while a finger is on the map; every room and symbol has its own enter/exit timer.</li>
         <li><b>Results (end)</b> — <code>summary.csv</code>, <code>room_order.csv</code>, <code>corner_motion.csv</code>, <code>corner_motion.json</code>, <code>finger_positions.json</code>, <code>floorplan.png</code>.</li>
-        <li><b>Run folder</b> — all 6 files saved together.</li>
+        <li><b>Run folder</b> — all 8 files saved together. <code>data/README.md</code> explains them for the people analyzing the data.</li>
       </ol>
+      <h3>Around a run</h3>
+      <ul><li><code>loop_pipeline.py</code> runs the whole study: every video with its map, one run at a time.</li><li><code>google_sheets/import_run.gs</code> imports the run folders into a Google Sheet: one tab per run, the three CSVs as three tables.</li></ul>
       <h3>Reading the arrows</h3>
       <ul><li>Solid arrow: data handed from one box to the next.</li><li>Dashed arrow: one file calling into another (the result comes back).</li><li>Orange frame: layers that repeat for every video frame.</li></ul>`;
   }
