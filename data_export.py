@@ -6,10 +6,20 @@ The run's final data files, for analysis outside this project.
 Written at the end of every run (run_pipeline.py calls save_data_files),
 into the run folder next to map.json and finger_paths.png:
 
-  summary.csv          one row per room (labeled by the symbol in it), then
-                       one per symbol not used as a label, plus the whole map:
-                         Element/Symbol, Symbol Visits, Symbol Time (s),
-                         Room Visits, Room Time (s), Room Dimension (in)
+  summary.csv          the whole map, then one row per room, then any symbol
+                       that belongs to no room:
+                         Room Symbol, Room Symbol Visits, Room Symbol Time,
+                         Entrance Symbol, Entrance Symbol Visits, Entrance Symbol Time,
+                         Room Visits, Room Time, Room Dimensions
+                       Room Symbol: the symbol(s) inside the room, or the area
+                       pattern the room is filled with (a corridor's dots,
+                       dashes or lines, a hatched area), with the room's name:
+                       "Stairs #5 (Room 1)", "Corridor #28 (Room 6)". A
+                       pattern covers the whole room, so its visits and time
+                       are the room's own. Entrance Symbol: the mark(s) on the
+                       walls leading into the room. Each of the three has its
+                       own timer; two symbols in one cell are added together.
+                       Times in seconds, dimensions in inches (width, height).
   room_order.csv       every room visit in order, revisits included:
                          Order, Time Entered (s), Time Exited (s)
   corner_motion.csv    a few times a second, how far each paper corner moved
@@ -26,12 +36,13 @@ rules (a visit is >= 1 s; shorter touches aren't counted). The "Entire
 map" row's Room Time is the main timer: total time at least one index
 finger was on the map (timing.InteractionTimer).
 
-Room labels: a room is named after the free-standing symbol(s) inside it,
-or, failing that, the entrance symbol(s) leading into it, followed by the
-room's own name from map.json -- e.g. "Stairs #5 (Room 1)". The corridor
-is named after its legend texture: "Corridor #28 (Room 6)". Symbol names
-come from the legend (see symbol_identification.py). Renaming a room in
-map.json (say to "Office") carries through: "Toilet #2 (Office)".
+Room labels (summary.csv's Room Symbol, room_order.csv's Order): a room is
+named after the free-standing symbol(s) inside it, or, failing that, its
+area pattern, followed by the room's own name from map.json -- e.g.
+"Stairs #5 (Room 1)", "Corridor #28 (Room 6)"; a room with neither is just
+"Room 4". Symbol and pattern names come from the legend (see
+symbol_identification.py). Renaming a room in map.json (say to "Office")
+carries through: "Toilet #2 (Office)".
 """
 
 import csv
@@ -100,24 +111,32 @@ class CornerMotion:
 
 # ---------------------------------------------------------------- summary + order
 
-def room_labels(room_map):
-    """({room id: label}, {room id: [symbol ids]}) -- see the module notes."""
+def room_symbols(room_map):
+    """({room id: [symbol ids inside it]}, {room id: [entrance symbol ids
+    leading into it]})."""
     inside = {r["id"]: [] for r in room_map.rooms}
     leading_in = {r["id"]: [] for r in room_map.rooms}
     for s in room_map.symbols:
         if s.get("entrance"):
             for rid in s.get("entrance_to", []):
                 if rid in leading_in:
-                    leading_in[rid].append(s)
+                    leading_in[rid].append(s["id"])
         elif s.get("room") in inside:
-            inside[s["room"]].append(s)
-    labels, symbol_ids = {}, {}
+            inside[s["room"]].append(s["id"])
+    return inside, leading_in
+
+
+def room_labels(room_map):
+    """({room id: label}, {room id: [ids of the symbols inside it]}) -- see
+    the module notes."""
+    inside, _ = room_symbols(room_map)
+    names_by_id = {s["id"]: s["name"] for s in room_map.symbols}
+    labels = {}
     for r in room_map.rooms:
-        syms = inside[r["id"]] or leading_in[r["id"]]
-        symbol_ids[r["id"]] = [s["id"] for s in syms]
-        names = " / ".join(s["name"] for s in syms) or (r.get("pattern") or {}).get("name")
+        names = (" / ".join(names_by_id[i] for i in inside[r["id"]])
+                 or (r.get("pattern") or {}).get("name"))
         labels[r["id"]] = f"{names} ({r['name']})" if names else r["name"]
-    return labels, symbol_ids
+    return labels, inside
 
 
 def _visits_and_time(timers):
@@ -126,28 +145,41 @@ def _visits_and_time(timers):
     return visits, total
 
 
+def _cells(name, timers):
+    """[name, visits, time] for one symbol cell; blanks if there's no symbol."""
+    if not timers:
+        return ["", "", ""]
+    visits, ms = _visits_and_time(timers)
+    return [name, visits, seconds(ms)]
+
+
 def summary_rows(timing, room_map, inches):
-    labels, symbol_ids = room_labels(room_map)
+    labels, _ = room_labels(room_map)
+    inside, leading_in = room_symbols(room_map)
     symbol_timers = {t.symbol["id"]: t for t in timing.symbols}
-    rows = [["Entire map", "", "", "", seconds(timing.paper.elapsed_ms()),
+    rows = [["Entire map", "", "", "", "", "", "", seconds(timing.paper.elapsed_ms()),
              f"({inches.width_in:g}, {inches.height_in:g})"]]
     used = set()
     for r in room_map.rooms:
         rid = r["id"]
         room_timer = timing.rooms[rid]
-        timers = [symbol_timers[i] for i in symbol_ids[rid] if i in symbol_timers]
-        used.update(symbol_ids[rid])
-        s_visits, s_ms = _visits_and_time(timers)
+        own = [symbol_timers[i] for i in inside[rid] if i in symbol_timers]
+        doors = [symbol_timers[i] for i in leading_in[rid] if i in symbol_timers]
+        used.update(inside[rid] + leading_in[rid])
+        if own:
+            room_symbol = _cells(labels[rid], own)
+        elif r.get("pattern"):   # the pattern fills the room: its timer is the room's
+            room_symbol = _cells(labels[rid], [room_timer])
+        else:
+            room_symbol = [labels[rid], "", ""]
         w, h = r.get("size_in") or inches.bbox_size(r["bbox"])
-        rows.append([labels[rid], s_visits if timers else "", seconds(s_ms) if timers else "",
-                     len(room_timer.visits), seconds(sum(v["duration_ms"] for v in room_timer.visits)),
-                     f"({w:g}, {h:g})"])
-    for sid, t in symbol_timers.items():
-        if sid in used:
-            continue
-        name = t.name + (f" (entrance to {t.room})" if t.entrance and t.room else "")
-        s_visits, s_ms = _visits_and_time([t])
-        rows.append([name, s_visits, seconds(s_ms), "", "", ""])
+        rows.append(room_symbol + _cells(" / ".join(t.name for t in doors), doors)
+                    + [len(room_timer.visits), seconds(sum(v["duration_ms"] for v in room_timer.visits)),
+                       f"({w:g}, {h:g})"])
+    for sid, t in symbol_timers.items():   # symbols that belong to no room
+        if sid not in used:
+            cells = _cells(t.name, [t])
+            rows.append((["", "", ""] + cells if t.entrance else cells + ["", "", ""]) + ["", "", ""])
     return rows
 
 
@@ -160,8 +192,9 @@ def order_rows(timing, room_map):
 
 # ---------------------------------------------------------------- writing
 
-SUMMARY_HEADER = ["Element/Symbol", "Symbol Visits", "Symbol Time (s)", "Room Visits",
-                  "Room Time (s)", "Room Dimension (in)"]
+SUMMARY_HEADER = ["Room Symbol", "Room Symbol Visits", "Room Symbol Time",
+                  "Entrance Symbol", "Entrance Symbol Visits", "Entrance Symbol Time",
+                  "Room Visits", "Room Time", "Room Dimensions"]
 ORDER_HEADER = ["Order", "Time Entered (s)", "Time Exited (s)"]
 CORNER_HEADER = ["Frame #", "Timestamp (s)"] + [f"{name} {axis}" for name in CORNER_NAMES
                                                 for axis in ("dx", "dy")]

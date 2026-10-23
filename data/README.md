@@ -130,14 +130,14 @@ The paper is found again in every video frame, even when it is rotated, slid aro
 
 ### Rooms
 
-The rooms are found automatically from the floorplan image. They are the areas enclosed by walls, with doorways treated as closed. Every map also has one **corridor**: the large dotted area connecting the rooms. Rooms are numbered `Room 1`, `Room 2`, ... in reading order (top-left first).
+The rooms are found automatically from the floorplan image. They are the areas enclosed by walls, with doorways treated as closed. Every map also has one **corridor**: the large textured area connecting the rooms. Rooms are numbered `Room 1`, `Room 2`, ... in reading order (top-left first).
 
 In the CSVs each room is **labeled by the symbol inside it**, followed by its number:
 
 - `Stairs #5 (Room 1)`: Room 1 contains the Stairs symbol, legend entry #5.
-- `Corridor #28 (Room 6)`: the corridor, named after its dot texture (legend #28 = horizontal dots, #29 = diagonal).
 - `Elevator #11 (2) (Room 4)`: the second of several Elevator #11 symbols on this map. The `(1)`, `(2)`, `(3)` numbering follows reading order.
-- If a room has no symbol inside it, it is labeled by the symbol on its doorway. If it has neither, it's just `Room N`.
+- A room filled with an **area pattern** is labeled by the pattern: the corridor's texture (`Corridor #26 (Room 6)` for a dashed line, #27 diagonal lines, #28 rows of dots, #29 diagonal dots) or a hatched area (`Dangerous / Inaccessible area #25 (Room 2)`).
+- If a room has neither a symbol nor a pattern, it's just `Room N`. (Its doorway's symbol has its own column, *Entrance Symbol*.)
 
 ### Symbols and the legend
 
@@ -146,7 +146,9 @@ Every symbol on the map is matched to the **tactile symbol legend** in `legends/
 Symbols come in two kinds:
 
 - **Free-standing symbols** are drawn inside a room. A symbol is "touched" when a fingertip is inside the symbol's box, which is the symbol plus a 6-pixel margin (about 1/16 inch).
-- **Entrance symbols** are drawn **on a wall**, like a doorway gap, a door mark, or a symbol marking an entrance. They are listed as `... (entrance to Room N)`. Because they're thin marks on a wall, they're touched over a slightly larger **entrance zone**: the mark plus 18 pixels (about 3/16 inch) around it.
+- **Entrance symbols** are drawn **on a wall**, like a doorway gap, a door mark, or a symbol marking an entrance. In `summary.csv` they're in the *Entrance Symbol* columns of the room they lead into. Because they're thin marks on a wall, they're touched over a slightly larger **entrance zone**: the mark plus 18 pixels (about 3/16 inch) around it.
+
+**Area patterns** (legend #25–#29) aren't marks but textures that fill a whole room, so a room's pattern is timed by the room's own timer.
 
 ### Visits, brushes and the 1-second rule
 
@@ -169,39 +171,46 @@ The `Entire map` row in `summary.csv` uses a different, stricter timer. It runs 
 
 ### `summary.csv`
 
-**Visits and time for each room and symbol.** This is the main results table, with one row per room or symbol.
+**Visits and time for each room, the symbol in it, and the symbol at its entrance.** This is the main results table, with one row per room.
 
 | Column | Meaning |
 |---|---|
-| **Element/Symbol** | What the row is about (see "Row types" below). |
-| **Symbol Visits** | Number of visits (≥ 1 s) to the symbol(s). On a room row, this counts the symbol(s) that label the room. |
-| **Symbol Time (s)** | Total seconds of those symbol visits. |
+| **Room Symbol** | The room, labeled by the symbol inside it or its area pattern, e.g. `Stairs #5 (Room 1)`, `Corridor #28 (Room 6)` (see [Rooms](#rooms)). |
+| **Room Symbol Visits** | Number of visits (≥ 1 s) to that symbol. For a room labeled by its area pattern, the pattern fills the room, so this is the room's own visit count. |
+| **Room Symbol Time** | Total seconds of those visits. |
+| **Entrance Symbol** | The symbol(s) on the walls leading into this room, e.g. `Door / Emergency exit #16 (1)`. Blank if the room's doorway has no symbol on record. |
+| **Entrance Symbol Visits** | Number of visits (≥ 1 s) to the entrance zone. |
+| **Entrance Symbol Time** | Total seconds of those visits. |
 | **Room Visits** | Number of visits (≥ 1 s) to the whole room. |
-| **Room Time (s)** | Total seconds of those room visits. On the `Entire map` row, this is the **main timer**: total time any fingertip was on the map. |
-| **Room Dimension (in)** | The room's size in inches as `(width, height)`: the width and height of the smallest box around the room, not its area. On the `Entire map` row, it's the sheet: `(8.5, 11)`. |
+| **Room Time** | Total seconds of those room visits. On the `Entire map` row, this is the **main timer**: total time any fingertip was on the map. |
+| **Room Dimensions** | The room's size in inches as `(width, height)`: the width and height of the smallest box around the room, not its area. On the `Entire map` row, it's the sheet: `(8.5, 11)`. |
+
+All times are in seconds.
 
 **Row types, in order:**
 
-1. **`Entire map`**: one row. Only *Room Time (s)* (time on the map) and *Room Dimension (in)* (the sheet size) are filled.
-2. **Room rows**, one per room in room-number order, for example `Stairs #5 (Room 1)`. The symbol columns describe the symbol(s) in the room's label. If a room is labeled by two symbols (`A / B (Room 3)`), their visits and times are added together. The corridor and unlabeled rooms have **blank** symbol columns.
-3. **Remaining symbol rows**: every symbol not already used as a room's label. These are mostly the entrance symbols (`Door / Emergency exit #16 (1) (entrance to Room 3)`). Only the symbol columns are filled.
+1. **`Entire map`**: one row. Only *Room Time* (time on the map) and *Room Dimensions* (the sheet size) are filled.
+2. **Room rows**, one per room in room-number order. If a room holds two symbols, or has two entrance symbols, they're listed together (`A / B`) and their visits and times are added together. A room with no symbol and no pattern has blank *Room Symbol* columns apart from its name; a room with no entrance symbol has blank *Entrance Symbol* columns.
+3. **Leftover symbol rows** (rare): a symbol that belongs to no room, in the *Room Symbol* or *Entrance Symbol* columns depending on its kind.
 
 **Example** (S-19, map E; first rows):
 
 ```
-Element/Symbol,Symbol Visits,Symbol Time (s),Room Visits,Room Time (s),Room Dimension (in)
-Entire map,,,,39.57,"(8.5, 11)"
-Stairs #5 (Room 1),2,2.97,2,7.27,"(2.17, 1.36)"
-Toilet #2 (Room 2),0,0.0,1,2.04,"(2.15, 1.38)"
-Corridor #28 (Room 6),,,3,4.37,"(2.99, 10.03)"
-Door / Emergency exit #16 (1) (entrance to Room 3),1,1.47,,,
+Room Symbol,Room Symbol Visits,Room Symbol Time,Entrance Symbol,Entrance Symbol Visits,Entrance Symbol Time,Room Visits,Room Time,Room Dimensions
+Entire map,,,,,,,74.47,"(8.5, 11)"
+Stairs #5 (Room 1),2,2.97,Door / Emergency exit #14 (1),0,0.0,2,7.31,"(2.17, 1.36)"
+Toilet #2 (Room 2),0,0.0,Door / Emergency exit #18 (1),0,0.0,1,2.04,"(2.15, 1.38)"
+Elevator #11 (1) (Room 3),4,12.54,Door / Emergency exit #16 (1),1,1.43,6,22.62,"(2.17, 1.34)"
+Corridor #28 (Room 6),4,5.27,,,,4,5.27,"(2.99, 10.03)"
 ```
 
 How to read it:
 
-- The participant had fingers on the map for **39.57 s** in total.
-- They visited Room 1 (the Stairs room) **twice**, spending **7.27 s** in it. Of that, **2.97 s** over 2 visits was on the Stairs symbol itself.
+- The participant had fingers on the map for **74.47 s** in total.
+- They visited Room 1 (the Stairs room) **twice**, spending **7.31 s** in it. Of that, **2.97 s** over 2 visits was on the Stairs symbol itself. They never stayed on its doorway (a plain gap, #14) for 1 s or more.
 - They entered Room 2 once (2.04 s) but **never stayed on its Toilet symbol for 1 s or more** (0 visits). They may have brushed it.
+- In Room 3 they spent 1.43 s on the entrance symbol (#16, four dots) on one visit.
+- The corridor is labeled by its dot pattern, which fills the room, so its symbol columns repeat the room's visits and time.
 
 **Things to keep in mind:**
 
@@ -303,9 +312,9 @@ Most useful fields:
 | `rooms[]` | One entry per room. |
 | ↳ `id`, `name` | Room number and name (`"Room 1"`). |
 | ↳ `polygon` | The room's outline as `[[x, y], ...]` points in map pixels. |
-| ↳ `bbox`, `size_in` | Bounding box `[x0, y0, x1, y1]` and its size in inches (the CSV's *Room Dimension*). |
+| ↳ `bbox`, `size_in` | Bounding box `[x0, y0, x1, y1]` and its size in inches (the CSV's *Room Dimensions*). |
 | ↳ `centroid`, `area_px` | Centre point and area in pixels. Divide the area by `px_per_inch`² for square inches. |
-| ↳ `pattern` | Only on the corridor: its legend dot pattern (`"Corridor #28"`). |
+| ↳ `pattern` | Only on a room filled with an area pattern (the corridor, a hatched area): the legend pattern it matched (`"Corridor #28"`), with `legend_id`, `description` and `match`. |
 | `symbols[]` | One entry per symbol. |
 | ↳ `id`, `name` | Symbol number and name (`"Stairs #5"`, `"Elevator #11 (2)"`). |
 | ↳ `legend_id`, `referent`, `description` | Which legend entry it matched, what it stands for, and how the legend describes the drawing. |
@@ -327,9 +336,10 @@ An exact copy of the map image the run used, so the folder is complete without t
 
 | Question | Where to look |
 |---|---|
-| How long did the participant spend on the map overall? | `summary.csv` → `Entire map` → *Room Time (s)* |
+| How long did the participant spend on the map overall? | `summary.csv` → `Entire map` → *Room Time* |
 | Which rooms did they explore, and which did they skip? | `summary.csv` → *Room Visits*. 0 means never visited for ≥ 1 s. |
-| How much attention did the target symbol get? | `summary.csv` → that symbol's *Symbol Visits* and *Symbol Time (s)* |
+| How much attention did the target symbol get? | `summary.csv` → the rows where it's the *Room Symbol* (or *Entrance Symbol*, for a door symbol): *Room Symbol Visits* and *Room Symbol Time* |
+| Did they find the way into a room? | `summary.csv` → that room's *Entrance Symbol Visits* and *Entrance Symbol Time* |
 | What order did they explore the rooms in? | `room_order.csv`, top to bottom |
 | When did they first reach a room? | `room_order.csv` → the first row with that room's label → *Time Entered (s)* |
 | How long after the map appeared did they reach it? | That *Time Entered* minus the first *Time Entered* in `room_order.csv` |
@@ -357,7 +367,7 @@ Before comparing **symbols across different maps**, check which legend ID each m
 - **Hands can be missed.** The hand model occasionally loses a hand for a few frames, especially with fast motion, poor lighting, or a hand mostly hidden under another. The 0.4 s allowance stops this from splitting visits, but a fingertip resting somewhere for a long time while undetected won't be counted.
 - **Left and Right can be wrong.** The labels come from the hand model and are smoothed over time, but crossed or overlapping hands can swap them. Use the combined data (either hand) unless handedness matters for your question.
 - **Index fingers only.** Exploration with other fingers or the palm isn't recorded.
-- **Rooms and symbols are found automatically.** This was checked closely on map E, where all 20 symbols (doorways included) were matched to the right legend entry. Other maps haven't all been checked by hand. If a label looks wrong, check the symbol's `match` value and compare `map.json` with `floorplan.png`. Very similar legend drawings (#13 vs #18, #21 vs #23) are the most likely to be confused. Area patterns (#25–#27) aren't detected as symbols, and doorways and wall symbols are only found on horizontal or vertical walls.
+- **Rooms and symbols are found automatically.** This was checked closely on map E, where all 20 symbols (doorways included) were matched to the right legend entry. Other maps haven't all been checked by hand. If a label looks wrong, check the symbol's `match` value and compare `map.json` with `floorplan.png`. Very similar legend drawings (#13 vs #18, #21 vs #23) are the most likely to be confused. Area patterns (#25–#29) are recognized by texture, and the pattern in `map.json` has its own `match` score (0 is perfect; above 0.5 is no pattern). Doorways and wall symbols are only found on horizontal or vertical walls.
 - **Some video-to-map pairings are assumptions.** Videos involving P29, A9 and A11 use a best guess for which of two similar map files was shown; see [`png_reference_maps/README.md`](../png_reference_maps/README.md). Confirm these before relying on runs for those maps.
 - **Tuned on one session.** The tracking settings were developed on S-19 (map E). Sessions with very different lighting, camera angle or map style may track less reliably; `finger_paths.png` is the fastest way to spot this.
 
@@ -369,7 +379,7 @@ Before comparing **symbols across different maps**, check which legend ID each m
 |---|---|---|
 | All times in the CSVs | seconds of video time | Two decimals; counted from the start of the video file |
 | `t_ms` in `finger_positions.json` | milliseconds of video time | ÷ 1000 → seconds |
-| Room Dimension | inches | Bounding-box width × height; the sheet is 8.5 × 11 in (US Letter) |
+| Room Dimensions | inches | Bounding-box width × height; the sheet is 8.5 × 11 in (US Letter) |
 | Positions in `finger_positions.json` and `map.json` | map pixels | `[0, 0]` = top-left of `floorplan.png`; x right, y down |
 | Map pixels → inches | ÷ 96 | For 816 × 1056 maps; otherwise use `px_per_inch` from `map.json` |
 | Corner movement (`corner_motion.*`) | video pixels per ¼ second | Depends on camera distance; not comparable to map pixels |

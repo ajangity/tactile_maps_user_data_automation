@@ -89,7 +89,7 @@ tactile_maps_user_data_automation/
 ├── label_symbols.py       optional: hand-drawn extra boxes
 ├── dashboard.py           standalone: rebuilds old runs' HTML dashboards
 ├── hand_landmarker.task   MediaPipe model
-├── legends/               symbol legend: 3 screenshots + symbol_legend.json
+├── legends/               symbol legend: symbol_legend.json + symbols/<code>.png (one page per symbol)
 ├── google_sheets/
 │   └── import_run.gs      Google Apps Script: import run folders into a Sheet
 ├── png_reference_maps/    every floorplan PNG + README (video → map matching)
@@ -232,21 +232,23 @@ On video frames the wall threshold is 40 px, since the map is smaller in the fra
 
 | Function | What it does |
 |---|---|
+| `texture_mask`, `hatching` | Area texture, found first so it's never taken for a symbol: solid dots and dashes (dot class, minus hollow rings) and hatching (thin straight diagonal strokes, ≥ 5 at one angle; bold hatching is looked for in the walls too) |
+| `room_walls(trace)` | The walls without bold hatching. `paper_locator` finds the rooms with these, or a hatched room is cut into strips by its hatch lines |
 | `find_wall_symbols(trace)` | Symbols drawn on a wall, which edge tracing counts as wall. Erases every straight wall run ≥ 45 px (morphological opening, horizontal and vertical); leftovers 10–80 px across are symbols. Also picks up hollow rings small enough to be classed as dots. |
 | `find_wall_gaps(trace)` | Doorways: along each wall line (long runs at the same x or y), a stretch with no ink 10–70 px long |
 | `merge_doorways` | A gap and the wall symbols within 20 px of it are one door (two ticks either side of a gap, four circles around one). The merged door is recognized as a whole; a gap with no symbol is legend #14. |
-| `find_symbols(trace)` | Those plus `Trace.symbol_marks()`, with overlapping ones merged |
+| `find_symbols(trace)` | Those plus the free-standing symbol marks (`symbol_marks`: edge tracing's symbol class minus the texture), with overlapping ones merged |
 | `normalize`, `thin` | Ink → 1 px centre lines (Zhang-Suen) → scaled into a 48×48 box, proportions kept |
-| `load_legend` | Reads `legends/symbol_legend.json`; each entry's template is its drawing cropped from the legend screenshot (`box`), as normalized centre lines. Gap / area-pattern entries have no template. |
+| `load_legend` | Reads `legends/symbol_legend.json` and cuts each entry's templates out of its page `legends/symbols/<code>.png` (the symbol printed twice, regular and small): free symbols from inside each square frame (`frame_cells`), wall symbols from the room outline's top and right walls (`wall_cells` / `top_wall_marks`: the mark with the wall under it, as a doorway on a map is cut out; marks touching a corner are skipped), area patterns as `texture_features`. #5 (Stair) has no page yet and is still cropped from `symbol_legend_1.png` (`box`). |
 | `recognize(ink, box, on_wall, wall_vertical)` | Chamfer distance to every legend template. Free-standing: upright, other turns + `ROTATION_PENALTY` (1 px), since orientation changes meaning (#2 vs #12). On a wall: turned so the wall is horizontal, as the legend draws it (`wall_is_vertical`), both ways round. The best wins if ≤ `MATCH_MAX` (1.5 px); otherwise `legend_id` None, "Unknown symbol". Doorways are matched with the wall stubs inside them. |
 | `name_symbols`, `legend_name` | Name = `<referent> #<legend id>` ("Elevator #11"); `<map>.legend.json` (`{"<id>": "name"}`) renames entries per map. Repeated names are numbered in reading order: "Elevator #11 (1)". |
-| `corridor_pattern` | The corridor's dot texture: nearest-neighbour steps mostly straight → #28, diagonal → #29. `paper_locator` stores it on the room as `pattern`, so the corridor is labeled "Corridor #28". |
+| `room_patterns`, `texture_features`, `recognize_texture` | Every textured room's area pattern: the share of its texture that is dots / dashes / lines, how many dots have their nearest neighbour straight across (rows) vs diagonal, how thick the lines are; nearest legend pattern page wins if within `AREA_MATCH_MAX` (0.5). `paper_locator` stores it on the room as `pattern`, so the room is labeled "Corridor #26", "Dangerous / Inaccessible area #25". `corridor_id` is the room with a Corridor pattern. |
 | `detect_symbols(trace, labels, map_path)` | The "symbols" section of `map.json`: each symbol + 6 px padding, tagged with its room. A symbol on a wall is an entrance: `entrance`, `entrance_to` (the rooms touching it, minus the corridor) and `entrance_zone` (the mark + 18 px) |
 | `restore_auto_names` | After `paper_locator` carries names over from the last run, puts back the generated name wherever the old one was never edited, or predates the legend (no `legend_id`) |
 | `SymbolTimer`, `SymbolTiming` | `timing.Timing` with symbol timers that also record `symbol`. Entrance symbols get type `"entrance"` and are timed over their `entrance_zone` |
-| CLI `main` | Prints every symbol's name, legend description and match distance, and the corridor's pattern; saves `<map>.symbols.png` |
+| CLI `main` | Prints every symbol's name, legend description and match distance, and every room's pattern; saves `<map>.symbols.png` |
 
-On map E: 20 symbols (10 free-standing, 10 on walls, doorway gaps included), all matched to a legend entry; correct matches score 0.0–1.0 px and the nearest wrong template ≥ 1.03 px. To add a shape, add its drawing to a legend screenshot in `legends/` and an entry (ID, referent, description, placement, `box`) to `legends/symbol_legend.json`. No shape is hard-coded.
+Checked on map E (20 symbols, 10 on walls; corridor #28: all correct) and map Stair (corridor #26 dashed line and hatched room #25 correct; 17 of 19 symbols: the star on a doorway wall is "Unknown symbol" and the circle-with-slash on a wall comes out Toilet #1, since free symbols placed on walls are only compared as wall marks). Patterns #27 and #29, and the door marks #13–#19 one at a time, were checked by putting them into map E. To add a symbol, add its page to `legends/symbols/` and an entry (ID, code, referent, description, placement, image) to `legends/symbol_legend.json`. No shape is hard-coded.
 
 ### `finger_tracking.py`: steps 22–24
 
@@ -283,7 +285,7 @@ Called once at the end of a run by `run_pipeline.py`, after `timing.finish()`. E
 
 ### `units.py`: pixels → inches
 
-Every map is printed on US Letter, so the PNG's long side is 11 in and its short side 8.5 in; one scale per axis converts any PNG distance. That's exactly 96 px/in for the 816 × 1056 floorplans. `PixelsToInches(w, h)` provides `point`, `size` and `bbox_size`. It's used by `paper_locator` (each room's `size_in`, plus `page_in` and `px_per_inch` in `map.json`) and by `data_export` (*Room Dimension (in)*). `python units.py map.png` prints each room's size.
+Every map is printed on US Letter, so the PNG's long side is 11 in and its short side 8.5 in; one scale per axis converts any PNG distance. That's exactly 96 px/in for the 816 × 1056 floorplans. `PixelsToInches(w, h)` provides `point`, `size` and `bbox_size`. It's used by `paper_locator` (each room's `size_in`, plus `page_in` and `px_per_inch` in `map.json`) and by `data_export` (*Room Dimensions*). `python units.py map.png` prints each room's size.
 
 ### `loop_pipeline.py`: batch runner
 
@@ -349,12 +351,13 @@ The researcher-facing description of every file a run saves is [`data/README.md`
 ### The three CSVs (`data_export.py`)
 
 ```
-summary.csv        Element/Symbol, Symbol Visits, Symbol Time (s), Room Visits, Room Time (s), Room Dimension (in)
+summary.csv        Room Symbol, Room Symbol Visits, Room Symbol Time, Entrance Symbol, Entrance Symbol Visits,
+                   Entrance Symbol Time, Room Visits, Room Time, Room Dimensions
 room_order.csv     Order, Time Entered (s), Time Exited (s)
 corner_motion.csv  Frame #, Timestamp (s), TL dx, TL dy, TR dx, TR dy, BR dx, BR dy, BL dx, BL dy
 ```
 
-- **`summary.csv` rows:** `Entire map` (Room Time = the main timer; dimension = the sheet), then one row per room labeled `"<symbol> (<room>)"`, then one row per symbol not used as a label. Columns that don't apply to a row are blank, not 0.
+- **`summary.csv` rows:** `Entire map` (Room Time = the main timer; dimensions = the sheet), then one row per room: its own symbol(s) (or its area pattern, timed by the room's timer) labeled `"<symbol> (<room>)"`, the entrance symbol(s) leading into it, and the room itself, each with its own visits and time; then any symbol that belongs to no room. Columns that don't apply to a row are blank, not 0. Times in seconds.
 - **`room_order.csv`:** room visits only (≥ 1 s), sorted by entry time. Rows can overlap in time when the two hands are in different rooms.
 - **`corner_motion.csv`:** blank vector cells mean the map wasn't in the frame, or it's the first sample after the map came back.
 
@@ -543,7 +546,7 @@ On map E this finds 11 rooms (10 rooms + the corridor). The sealing width it pic
 - **Speed.** Processing runs at ~6 fps; the first 21 s of S-19 stutter in display mode because of whole-frame searches every 10 frames.
 - **Display mode** was checked with a screenshot harness, not driven on a real screen.
 - **Auto-generated names.** Rooms are named `Room N` in reading order; rename them in `map.json`.
-- **Symbol names follow the legend in `legends/`.** A symbol is named after the legend entry it matches ("<referent> #<ID>"), wherever it's drawn: the circle-with-dot and the B on map E's walls match Toilet #1 and Toilet #4, though on a wall their timers are entrance timers. The legend's templates are its own low-resolution screenshot drawings (about 20 px across), so very similar entries (#13 circle vs #18, #21 triangle vs #23) are told apart by small margins; only map E has been checked. A symbol that matches nothing within 1.5 px comes out as "Unknown symbol". The area patterns #25–#27 aren't detected. Wall symbols and doorways are only found on horizontal or vertical walls.
+- **Symbol names follow the legend in `legends/`.** A symbol is named after the legend entry it matches ("<referent> #<ID>"), wherever it's drawn: the circle-with-dot and the B on map E's walls match Toilet #1 and Toilet #4, though on a wall their timers are entrance timers. The templates come from the symbol pages in `legends/symbols/`, printed like the maps. Very similar entries (#13 circle vs #18, #21 triangle vs #23) are still told apart by small margins; maps E and Stair have been checked. A symbol that matches nothing within 1.5 px comes out as "Unknown symbol". Area patterns are matched by texture, not shape. Wall symbols and doorways are only found on horizontal or vertical walls.
 
 ---
 

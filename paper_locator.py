@@ -92,15 +92,15 @@ class ReferenceMap:
                                    [self.w - 1, self.h - 1], [0, self.h - 1]])
 
         self.trace = edge_tracing.Trace(self.gray)
-        label_image, rooms, gap, _ = detect_rooms(self.trace.walls)
+        label_image, rooms, gap, _ = detect_rooms(symbol_identification.room_walls(self.trace))
         symbols = symbol_identification.detect_symbols(self.trace, label_image, path)
         self.json_path = json_path or os.path.splitext(path)[0] + ".map.json"
         rooms, symbols = _keep_custom_names(names_from or self.json_path, rooms, symbols)
         symbol_identification.restore_auto_names(names_from or self.json_path, symbols)
-        corridor = symbol_identification.corridor_pattern(self.trace, label_image, path)
-        for room in rooms:   # the corridor is named after its legend texture ("Corridor #28")
-            if corridor and room["id"] == corridor[0]:
-                room["pattern"] = corridor[1]
+        patterns = symbol_identification.room_patterns(self.trace, label_image, path)
+        for room in rooms:   # a patterned room is named after its legend texture ("Corridor #28")
+            if room["id"] in patterns:
+                room["pattern"] = patterns[room["id"]]
         self.inches = PixelsToInches(self.w, self.h)
         for room in rooms:   # (width, height) of the room's bounding box on the paper
             room["size_in"] = list(self.inches.bbox_size(room["bbox"]))
