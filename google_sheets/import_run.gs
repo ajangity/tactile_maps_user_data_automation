@@ -43,7 +43,23 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Tactile Maps')
     .addItem('Import run CSVs...', 'showImportDialog')
+    .addItem('Delete all tabs...', 'deleteAllTabs')
     .addToUi();
+}
+
+/** Deletes every tab after asking. A spreadsheet must keep one tab, so it's
+ * left with a single empty "Sheet1" (which the next import drops). */
+function deleteAllTabs() {
+  var ui = SpreadsheetApp.getUi();
+  var answer = ui.alert('Delete all tabs',
+    'Delete every tab in this spreadsheet? This cannot be undone.', ui.ButtonSet.YES_NO);
+  if (answer !== ui.Button.YES) return;
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var blank = ss.insertSheet('Empty ' + Date.now());
+  ss.getSheets().forEach(function (s) {
+    if (s.getSheetId() !== blank.getSheetId()) ss.deleteSheet(s);
+  });
+  blank.setName('Sheet1');
 }
 
 function showImportDialog() {
