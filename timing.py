@@ -20,13 +20,21 @@ Every room / symbol timer works the same way (RegionTimer):
   - two hands inside at once count as one visit, not two
   - only visits of at least MIN_VISIT_MS (1 second) count as visits;
     shorter ones are "brushes" (a finger passing over)
+
+Every timer also runs once per hand (Timing.hand_timers): the same rules,
+but seeing only the left, or only the right, index fingertip. So a room's
+Left time is how long the left index finger was in it. The two hands'
+times can add up to more than the timer's own time: while both fingers
+are inside, both hands' timers run, but the timer itself counts it once.
 """
 
+import copy
 import json
 import os
 
 MIN_VISIT_MS = 1000
 EXIT_GRACE_MS = 400
+HANDS = ("Left", "Right")
 
 
 class RegionTimer:
@@ -73,6 +81,18 @@ class RegionTimer:
         else:
             self.brushes += 1
         self._start = None
+
+    def for_one_hand(self):
+        """A fresh copy of this timer (same region and rules, no visits)
+        for Timing to run on one hand's fingertip."""
+        timer = copy.copy(self)
+        timer.visits, timer.brushes = [], 0
+        timer._start, timer._last_inside, timer._hands = None, None, set()
+        return timer
+
+    def total_ms(self):
+        """Time in all finished visits."""
+        return sum(v["duration_ms"] for v in self.visits)
 
     def summary(self):
         durations = [v["duration_ms"] for v in self.visits]
@@ -185,6 +205,13 @@ class Timing:
         self.manual = [RegionTimer(name, b["type"], _in_bbox(b["bbox"]),
                                    {"bbox": [round(v, 1) for v in b["bbox"]]})
                        for name, b in (manual_boxes or {}).items()]
+        self._by_hand = {}
+
+    def hand_timers(self, timer):
+        """{"Left": timer, "Right": timer}: `timer` run on one hand only."""
+        if id(timer) not in self._by_hand:
+            self._by_hand[id(timer)] = {hand: timer.for_one_hand() for hand in HANDS}
+        return self._by_hand[id(timer)]
 
     def all(self):
         return [self.paper, *self.rooms.values(), *self.symbols, *self.manual]
@@ -194,6 +221,8 @@ class Timing:
         for timer in self.all():
             inside = {t["hand"] for t in tips if timer.contains(t["map_x"], t["map_y"], t)}
             timer.step(inside, timestamp_ms)
+            for hand, one in self.hand_timers(timer).items():
+                one.step(inside & {hand}, timestamp_ms)
 
     def occupied(self):
         return [t for t in self.all() if t.occupied]
@@ -201,6 +230,8 @@ class Timing:
     def finish(self):
         for timer in self.all():
             timer.close()
+            for one in self.hand_timers(timer).values():
+                one.close()
 
     def summaries(self):
         """{name: summary} for every timer except the paper one."""

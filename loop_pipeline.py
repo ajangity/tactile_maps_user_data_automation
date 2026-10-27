@@ -10,9 +10,11 @@ Videos are read from mp4_user_data/ and maps from png_reference_maps/.
 Pairs whose video isn't on disk yet are skipped. Ctrl+C stops the batch.
 """
 
+import json
 import os
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VIDEO_DIR = "mp4_user_data"
@@ -217,8 +219,24 @@ PAIRS = [
 ]
 
 
+def flagged_runs(since):
+    """Run folders written since `since` whose tracking_quality.json says
+    they need checking by hand (see data_export.tracking_quality)."""
+    data = os.path.join(HERE, "data")
+    out = []
+    for d in sorted(os.listdir(data)) if os.path.isdir(data) else []:
+        path = os.path.join(data, d, "tracking_quality.json")
+        if os.path.exists(path) and os.path.getmtime(path) >= since:
+            with open(path, encoding="utf-8") as f:
+                quality = json.load(f)
+            if quality["status"] == "check":
+                out.append((d, quality["reasons"]))
+    return out
+
+
 def main():
     ran, skipped, failed = 0, [], []
+    started = time.time()
     try:
         for i, (video_name, map_name) in enumerate(PAIRS, 1):
             video = os.path.join(VIDEO_DIR, video_name)
@@ -244,6 +262,11 @@ def main():
         print("Skipped: " + ", ".join(skipped))
     if failed:
         print("Failed: " + ", ".join(failed))
+    flagged = flagged_runs(started)
+    if flagged:
+        print(f"\n{len(flagged)} run(s) to check by hand (tracking_quality.json):")
+        for d, reasons in flagged:
+            print(f"  {d}: " + "; ".join(reasons))
 
 
 if __name__ == "__main__":

@@ -10,7 +10,10 @@ Step 9   weighted_points          -- points every 4 px along each edge
 Step 10  fit_side_line            -- robust line of best fit per side.
 Step 12  fit_quad                 -- extend the 4 side lines until they meet
                                      -> 4 corners (works even when a corner
-                                     is hidden, as long as its 2 sides show).
+                                     is hidden, as long as its 2 sides show,
+                                     and when a whole side is hidden:
+                                     complete_side puts it back from the
+                                     other 3 and the paper's proportions).
 Step 13  refine_with_traced_lines -- edge tracing improves the crop: line
                                      the PNG's printed lines up with the
                                      lines traced in the frame (ICP).
@@ -33,7 +36,7 @@ import cv2
 import numpy as np
 
 import edge_tracing
-from paper_locator import SIDE_ANGLE_TOLERANCE, SIDES, classify_segments
+from paper_locator import SIDE_ANGLE_TOLERANCE, SIDE_CORNERS, SIDES, classify_segments
 
 MIN_SEGMENT_LENGTH = 25       # px; shorter Hough segments are creases/noise
 HOUGH_THRESHOLD = 40
@@ -95,36 +98,106 @@ def intersect(line_a, line_b):
 
 
 def fit_quad(crop_mask, x0, y0, prior):
-    """Corners of one paper blob, using `prior` (last frame's crop, or the
-    blob's rough outline on the first frame) to tell the sides apart.
+    """Corners of one paper blob, using `prior` (last frame's crop) to tell
+    the sides apart.
 
     Returns (quad, visible): visible[i] is True when both sides meeting at
     corner i were actually seen this frame (a real, unhidden corner).
-    Returns (None, None) unless all 4 sides were seen.
+    Returns (None, None) unless at least 3 sides were seen; a hidden 4th
+    side (usually the one under the participant's arms) is placed using
+    last frame's crop's own proportions (complete_side), which already
+    carry this frame's perspective.
     """
+    options = fit_quad_options(crop_mask, x0, y0, prior)
+    return options[0] if options else (None, None)
+
+
+def fit_quad_options(crop_mask, x0, y0, prior, aspect=None, stretches=(1.0,)):
+    """fit_quad's candidates, as a list of (quad, visible): the 4 fitted
+    sides, if all were seen, then the hidden side completed. With `aspect`
+    (the PNG's width / height) -- for a blob's rough outline, before the
+    first lock, when there are no trusted proportions -- the hidden side is
+    placed by the paper's shape, at each of `stretches` times that distance
+    (perspective makes the far side of the table look shorter), and the
+    least-supported of 4 seen sides is also tried as hidden: it's often a
+    sleeve's or a head's edge lying across the paper's real edge. The
+    alignment score picks between them."""
     if crop_mask.shape[0] < 20 or crop_mask.shape[1] < 20:
-        return None, None
+        return []
     edges = cv2.Canny(crop_mask, 50, 150)
     raw = cv2.HoughLinesP(edges, 1, np.pi / 180, HOUGH_THRESHOLD,
                           minLineLength=MIN_SEGMENT_LENGTH, maxLineGap=12)
-    if raw is None or len(raw) < 4:
-        return None, None
+    if raw is None or len(raw) < 3:
+        return []
     segments = raw.reshape(-1, 4).astype(np.float32) + [x0, y0, x0, y0]
     by_side = classify_segments(segments, prior)          # step 8
-    lines = {}
+    lines, support = {}, {}
     for side in SIDES:
         if by_side[side]:
             pts = np.concatenate([weighted_points(*s) for s in by_side[side]])
             lines[side] = fit_side_line(pts)                 # steps 9-10
-    if len(lines) < 4:
-        return None, None
+            support[side] = len(pts)
+    out = []
+    if len(lines) == 4:
+        out.append((_corners(lines), [True, True, True, True]))
+        hidden = [min(lines, key=support.get)] if aspect else []
+    elif len(lines) == 3:
+        hidden = [next(s for s in SIDES if s not in lines)]
+    else:
+        hidden = []
+    for side in hidden:
+        rest = {k: v for k, v in lines.items() if k != side}
+        for stretch in (stretches if aspect else (1.0,)):
+            line = complete_side(rest, side, prior, aspect, stretch)
+            if line is not None:
+                visible = [i not in SIDE_CORNERS[side] for i in range(4)]
+                out.append((_corners({**rest, side: line}), visible))
+    return [(q, v) for q, v in out if q is not None]
+
+
+def _corners(lines):
     corners = [intersect(lines["top"], lines["left"]),
                intersect(lines["top"], lines["right"]),
                intersect(lines["bottom"], lines["right"]),
                intersect(lines["bottom"], lines["left"])]
-    if any(c is None for c in corners):
-        return None, None
-    return np.float32(corners), [True, True, True, True]
+    return None if any(c is None for c in corners) else np.float32(corners)
+
+
+OPPOSITE = {"top": "bottom", "bottom": "top", "left": "right", "right": "left"}
+
+
+def complete_side(lines, missing, prior, aspect=None, stretch=1.0):
+    """The line of a side that wasn't seen, from the 3 that were: parallel
+    to the opposite side, `reach` away from it along the two adjacent sides.
+    reach keeps prior's proportions (opposite side : adjacent sides) -- or,
+    with `aspect`, the paper's own (long : short side; which one the seen
+    opposite side is, is judged from prior), times `stretch`. The side lies
+    on the same side of the opposite one as it did in prior. None if the
+    seen sides don't meet."""
+    adjacent = [s for s in SIDES if s not in (missing, OPPOSITE[missing])]
+    opposite = lines[OPPOSITE[missing]]
+    ends = [intersect(opposite, lines[s]) for s in adjacent]
+    if any(e is None for e in ends):
+        return None
+    length = float(np.linalg.norm(ends[1] - ends[0]))
+    p = np.asarray(prior, np.float32)
+    side_len = lambda s: float(np.linalg.norm(p[SIDE_CORNERS[s][0]] - p[SIDE_CORNERS[s][1]]))
+    across = (side_len(adjacent[0]) + side_len(adjacent[1])) / 2
+    if aspect:
+        ratio = max(aspect, 1.0 / aspect)
+        reach = stretch * (length / ratio if side_len(OPPOSITE[missing]) >= across else length * ratio)
+    else:
+        reach = length * across / max(side_len(OPPOSITE[missing]), 1.0)
+    i, j = SIDE_CORNERS[missing]
+    toward = (p[i] + p[j]) / 2
+    new = []
+    for end, side in zip(ends, adjacent):
+        d = lines[side][1] / (np.linalg.norm(lines[side][1]) + 1e-6)
+        if np.dot(toward - end, d) < 0:
+            d = -d
+        new.append(end + reach * d)
+    direction = new[1] - new[0]
+    return np.float32(new[0]), np.float32(direction / (np.linalg.norm(direction) + 1e-6))
 
 
 # ---------------------------------------------------------------- step 13
@@ -197,7 +270,8 @@ def shift_candidates(ref, frame_ink, H_frame_to_map):
     Returns the best few shifted homographies; each still needs step 13's
     refinement and the usual checks."""
     if not hasattr(ref, "_shift_fft"):
-        printed = ((ref.trace.ink > 0) & (ref.trace.classes != edge_tracing.CLASS_DOT))
+        printed = ((ref.trace.ink > 0) & ~ref.texture &
+                   (ref.trace.classes != edge_tracing.CLASS_DOT))
         printed = cv2.dilate(printed.astype(np.float32), np.ones((5, 5), np.uint8))
         ref._shift_pad = (2 * ref.h, 2 * ref.w)
         ref._shift_fft = np.fft.rfft2(printed, ref._shift_pad)

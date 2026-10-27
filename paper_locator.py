@@ -7,6 +7,8 @@ Auto-crop, part 1 (pipeline steps 1-8): know the map, find the paper.
 Step 1  load_reference_map    -- read the PNG and write its map JSON: every
                                  black line as a graph (nodes + edges), the
                                  rooms, the symbols.
+        texture_region        -- the PNG's hatched / dotted areas, which the
+                                 camera blurs: scoring and ICP skip them.
 Step 2  paper_mask            -- bright, low-color pixels = paper.
 Step 3  paper_blob_quads      -- rough 4-corner outline of each paper blob
         traced_map_quads      -- ...and of each cluster of printed walls
@@ -49,6 +51,11 @@ TRACED_WALL_MIN = 40      # px in the frame; traced marks this long count as wal
 SCORE_TOLERANCE = 5.0     # map px; a traced line this close to a printed line "matches"
 CLASS_WEIGHTS = {edge_tracing.CLASS_WALL: 0.4, edge_tracing.CLASS_SYMBOL: 0.4,
                  edge_tracing.CLASS_DOT: 0.2}
+TEXTURE_WINDOW = 41       # PNG px; ink density is measured over this window...
+TEXTURE_DENSITY = 0.11    # ...and an area this inky is a hatch / dot texture, not lines
+TEXTURE_MIN_AREA = 4000   # PNG px; smaller inky spots are bold symbols, not textures
+TEXTURE_SHRINK = 12       # PNG px; pull the area back off the walls that border it
+MIN_VISIBLE = 0.15        # share of a class's printed pixels that must be in view to judge it
 # Step 6
 SEARCH_MARGIN = 0.35      # grow last frame's crop by 35%. Tested 20% on S-19 (20-50 s):
                           # 3x more frames where the crop couldn't be confirmed, and
@@ -125,11 +132,28 @@ class ReferenceMap:
     def _prepare_scoring(self):
         """Lookup tables for alignment_score (step 4) and the traced-line
         refinement (step 13): distance from every map pixel to the nearest
-        printed line of each class, and which printed pixel that is."""
+        printed line of each class, and which printed pixel that is.
+
+        Hatched and dotted areas (texture_region) are left out of both: the
+        camera sees them as a gray smear, not as the PNG's fine lines, so
+        expecting those lines made every correct crop on a textured map
+        look like it was missing most of its walls."""
+        self.texture = texture_region(self.trace)
+        # ...and the frame's ink isn't judged anywhere near a texture: its
+        # edge was pulled in by TEXTURE_SHRINK, and the camera blurs it wider.
+        zone = 2 * (TEXTURE_SHRINK + 6) + 1
+        self.texture_zone = cv2.dilate(self.texture.astype(np.uint8), cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (zone, zone))) > 0
         self.class_present = {}
         self.class_dist = {}
+        small = (self.trace.ink > 0) & ~self.texture & (self.trace.classes != edge_tracing.CLASS_WALL)
+        # Symbols and dots are judged together: through the camera's blur a
+        # dashed line's dashes run together into symbol-sized marks, and a
+        # small symbol can fall apart into dots.
+        self.small_dist = cv2.distanceTransform(np.where(small, 0, 255).astype(np.uint8),
+                                                cv2.DIST_L2, 3)
         for c in CLASS_WEIGHTS:
-            here = self.trace.classes == c
+            here = (self.trace.classes == c) & ~self.texture
             self.class_present[c] = here
             self.class_dist[c] = cv2.distanceTransform(
                 np.where(here, 0, 255).astype(np.uint8), cv2.DIST_L2, 3)
@@ -137,12 +161,28 @@ class ReferenceMap:
         # the dots repeat every few pixels, so a crop shifted by a few dot
         # spacings still "fits" them, and a fit that leans on them can slide
         # sideways when hands cover the walls.
-        structure = np.where((self.trace.ink > 0) &
+        structure = np.where((self.trace.ink > 0) & ~self.texture &
                              (self.trace.classes != edge_tracing.CLASS_DOT), 255, 0).astype(np.uint8)
         self.ink_dist, self.ink_label = cv2.distanceTransformWithLabels(
             255 - structure, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
         zy, zx = np.nonzero(structure == 255)   # same raster order as the labels
         self.ink_xy = np.stack([zx, zy], 1).astype(np.float32)
+
+
+def texture_region(trace):
+    """Mask of the PNG's hatched / dotted areas: wherever the ink is dense
+    over a TEXTURE_WINDOW-wide area (a lone wall line, even a crossing, is
+    far sparser). Found from each PNG itself, so new map designs need no
+    setup."""
+    ink = (trace.ink > 0).astype(np.float32)
+    dense = (cv2.boxFilter(ink, -1, (TEXTURE_WINDOW, TEXTURE_WINDOW)) > TEXTURE_DENSITY).astype(np.uint8)
+    disc = lambda d: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+    dense = cv2.morphologyEx(dense, cv2.MORPH_OPEN, disc(31))
+    dense = cv2.erode(dense, disc(2 * TEXTURE_SHRINK + 1))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(dense, connectivity=8)
+    big = stats[:, cv2.CC_STAT_AREA] >= TEXTURE_MIN_AREA
+    big[0] = False
+    return big[labels]
 
 
 def _keep_custom_names(json_path, rooms, symbols):
@@ -237,11 +277,12 @@ def four_corner_outline(points):
     return order_quad_points(cv2.boxPoints(cv2.minAreaRect(hull)))
 
 
-def paper_blob_quads(frame):
+def paper_blob_quads(frame, mask_fn=None):
     """Every sizable paper blob in the whole frame, as (rough_quad, blob_mask,
-    bounding box). corner_fitting.fit_quad turns each into precise corners."""
+    bounding box). corner_fitting.fit_quad turns each into precise corners.
+    mask_fn: which pixels are paper (default paper_mask)."""
     h, w = frame.shape[:2]
-    mask = paper_mask(frame)
+    mask = (mask_fn or paper_mask)(frame)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     out = []
     for i in range(1, n):
@@ -308,7 +349,7 @@ def homography_for(quad, ref):
     return cv2.getPerspectiveTransform(np.asarray(quad, np.float32), ref.corners)
 
 
-def alignment_score(ref, frame_ink, H_frame_to_map, tol=SCORE_TOLERANCE):
+def alignment_score(ref, frame_ink, H_frame_to_map, tol=SCORE_TOLERANCE, visible=None):
     """The scoring rubric: how well does this crop line the frame's traced
     lines up with the PNG's printed lines? 0 = nothing matches, 1 = perfect.
 
@@ -325,7 +366,13 @@ def alignment_score(ref, frame_ink, H_frame_to_map, tol=SCORE_TOLERANCE):
     For each class:
       precision = share of the frame's traced pixels that land within `tol`
                   px of a printed pixel of that class (is what we see on the
-                  map?) -- unaffected by hands covering part of the map
+                  map?) -- unaffected by hands covering part of the map.
+                  Symbols and dots count each other as a match, in both
+                  directions: blur runs a dashed line's dashes together into
+                  symbol-sized marks, and they flip between the two classes
+                  from frame to frame. The printed symbols still decide the
+                  orientation -- turned the wrong way, they land where the
+                  frame has no ink at all.
       recall    = share of the PNG's printed pixels that have a traced pixel
                   within `tol` px (how much of the map do we see?) -- drops
                   when hands cover it
@@ -333,6 +380,16 @@ def alignment_score(ref, frame_ink, H_frame_to_map, tol=SCORE_TOLERANCE):
                   beta = 0.5), so occlusion costs less than mismatches.
     score = 0.4 * F_walls + 0.4 * F_symbols + 0.2 * F_dots (weights are
     renormalized if the map has no dots, say).
+
+    Hatched / dotted areas of the PNG (ReferenceMap.texture) are left out:
+    the camera blurs them, so neither their printed lines nor the frame's
+    ink inside them says anything about the crop.
+
+    visible (optional, frame-sized, 0 = covered; see paper_model.py): recall
+    then only counts printed pixels that aren't under a hand, sleeve or
+    anything else, so a correct crop on a mostly covered page still scores
+    well. A class with less than MIN_VISIBLE of its printed pixels in view
+    is skipped; if the whole map is that hidden, visibility is ignored.
 
     Measured on the S-19 video: right orientation 0.98-0.99; same map
     rotated 180 degrees ~0.40; 90/270 degrees 0.10-0.14; the decoy sheet
@@ -344,13 +401,31 @@ def alignment_score(ref, frame_ink, H_frame_to_map, tol=SCORE_TOLERANCE):
     if np.count_nonzero(warped) < 50:
         return result
     classes = edge_tracing.ink_classes(warped)
+    in_view = None
+    if visible is not None:
+        in_view = cv2.warpPerspective(visible, H_frame_to_map, (ref.w, ref.h),
+                                      flags=cv2.INTER_NEAREST) > 0
+        printed_all = sum(int(ref.class_present[c].sum()) for c in CLASS_WEIGHTS)
+        shown_all = sum(int((ref.class_present[c] & in_view).sum()) for c in CLASS_WEIGHTS)
+        result["visible"] = round(shown_all / max(printed_all, 1), 3)
+        if shown_all < MIN_VISIBLE * printed_all:
+            in_view = None
     total, weight_sum = 0.0, 0.0
     for c, weight in CLASS_WEIGHTS.items():
         printed = ref.class_present[c]
         if not printed.any():
             continue
-        seen = classes == c
-        precision = float((ref.class_dist[c][seen] <= tol).mean()) if seen.any() else 0.0
+        if in_view is not None:
+            if (printed & in_view).sum() < MIN_VISIBLE * printed.sum():
+                continue
+            printed = printed & in_view
+        if c == edge_tracing.CLASS_WALL:
+            seen, near = classes == c, ref.class_dist[c]
+        else:   # symbols and dots stand in for each other (see small_dist)
+            seen = (classes == edge_tracing.CLASS_SYMBOL) | (classes == edge_tracing.CLASS_DOT)
+            near = ref.small_dist
+        judged = seen & ~ref.texture_zone   # ink in or at a texture is neither right nor wrong
+        precision = float((near[judged] <= tol).mean()) if judged.any() else 0.0
         seen_dist = cv2.distanceTransform(np.where(seen, 0, 255).astype(np.uint8),
                                           cv2.DIST_L2, 3)
         recall = float((seen_dist[printed] <= tol).mean())
@@ -381,15 +456,16 @@ def search_window(prior_corners, frame_shape, margin=SEARCH_MARGIN):
     return max(0, x0), max(0, y0), min(w, x1), min(h, y1)
 
 
-def candidate_blobs(frame, window, prior_corners):
+def candidate_blobs(frame, window, prior_corners, mask_fn=None):
     """Each separate paper blob inside the search window as its own mask
     (cropped to the window), nearest last frame's crop first. A second
     sheet is a separate blob, so its edges can never leak into the real
-    page's line fit. The paper mask is computed on the window only."""
+    page's line fit. The paper mask (mask_fn, default paper_mask) is
+    computed on the window only."""
     x0, y0, x1, y1 = window
     if x1 - x0 < 20 or y1 - y0 < 20:
         return []
-    mask = paper_mask(frame[y0:y1, x0:x1])
+    mask = (mask_fn or paper_mask)(frame[y0:y1, x0:x1])
     n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     centre = np.asarray(prior_corners, np.float32).mean(axis=0) - [x0, y0]
     ranked = sorted((i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= MIN_CANDIDATE_AREA),

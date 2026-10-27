@@ -78,6 +78,7 @@ tactile_maps_user_data_automation/
 ├── paper_locator.py       auto-crop part 1 (steps 1–8)
 ├── corner_fitting.py      auto-crop part 2 (steps 9–17)
 ├── crop_checker.py        checks + backups (steps 14, 18, 19, 21)
+├── paper_model.py         this video's paper color → what's covering the page
 ├── edge_tracing.py        printed-line tracing (PNG + frames)
 ├── room_tracking.py       rooms from the PNG
 ├── symbol_identification.py   finds, recognizes and names each symbol
@@ -88,6 +89,10 @@ tactile_maps_user_data_automation/
 ├── manual_crop.py         Space-key corner dragging + video window
 ├── label_symbols.py       optional: hand-drawn extra boxes
 ├── dashboard.py           standalone: rebuilds old runs' HTML dashboards
+├── benchmark.py           crop tracker test set: run it after any auto-crop change
+├── flag_runs.py           lists runs in data/ that need a second look (data/flagged_runs.csv)
+├── place_corners.py       place the map's corners by hand once per video (manual_corners.json)
+├── benchmark/             10 random videos, 80 frames, their true corners, past runs
 ├── hand_landmarker.task   MediaPipe model
 ├── legends/               symbol legend: symbol_legend.json + symbols/<code>.png (one page per symbol)
 ├── google_sheets/
@@ -117,6 +122,7 @@ The pipeline runs in 8 layers, top to bottom. Layers 4–6 repeat for every vide
    │      │                  paper_locator (steps 2–8, scoring rubric)   │
    │      │                  corner_fitting (steps 9–17, ICP, shift)     │
    │      │                  crop_checker (14, 18, 19, 21)               │
+   │      │                  paper_model (what covers the page)          │
    │      │ ◄── manual_crop.py (Space)                                   │
    │      ▼ 4 corners                                                    │
 5  │ finger_tracking.py ◄── hand_landmarker.task ─► session log, trails  │
@@ -156,9 +162,10 @@ Creates the run folder and builds the `ReferenceMap`, which writes `map.json`. I
 
 | Step | Function | What it does |
 |---|---|---|
-| 1 | `ReferenceMap(path, json_path, names_from)` | Loads the PNG, compositing transparency onto white. Traces it, detects rooms and symbols, and writes `map.json`. Precomputes scoring tables: per-class distance transforms, plus nearest walls-and-symbols pixel lookups for ICP. |
-| 2 | `paper_mask` / `ink_border_mask` | Otsu brightness split minus colorful (skin) pixels; fallback: everything darker than gray 180 |
-| 3 | `paper_blob_quads`, `traced_map_quads` | Starting outlines from paper blobs, and from clusters of traced walls (needs no paper edge) |
+| 1 | `ReferenceMap(path, json_path, names_from)` | Loads the PNG, compositing transparency onto white. Traces it, detects rooms and symbols, and writes `map.json`. Precomputes scoring tables: per-class distance transforms, plus nearest walls-and-symbols pixel lookups for ICP. All of them leave out the hatched / dotted areas (`texture`). |
+| 1 | `texture_region(trace)` | The PNG's hatched and dotted areas: wherever ink covers > 11% of a 41 px window, areas ≥ 4000 px, pulled 12 px back off the walls around them. The camera sees these as a gray smear, never as the PNG's fine lines, so scoring and ICP ignore them (§7.1). Found from each PNG, so a new map design needs no setup. |
+| 2 | `paper_mask` / `ink_border_mask` | Otsu brightness split minus colorful (skin) pixels; fallback: everything darker than gray 180. (Pale skin passes this mask; `paper_model.PaperModel.sheet_mask` is the stricter, per-video one.) |
+| 3 | `paper_blob_quads(frame, mask_fn)`, `traced_map_quads` | Starting outlines from paper blobs (from any paper mask), and from clusters of traced walls (needs no paper edge) |
 | 4 | `orientations`, `alignment_score` | 4 corner labelings per outline; the scoring rubric (§7.1) |
 | 6 | `search_window` | Last frame's crop grown 35% |
 | 7 | `candidate_blobs` | Up to 3 separate paper blobs in the window, nearest first |
@@ -171,7 +178,8 @@ Creates the run folder and builds the `ReferenceMap`, which writes `map.json`. I
 |---|---|---|
 | 9 | `weighted_points` | Points every 4 px along a segment; loose angle match → fewer points (min 15%) |
 | 10 | `fit_side_line` | Huber line fit, drop outliers beyond median + 4×MAD, refit |
-| 12 | `fit_quad` | Canny + Hough on a mask → sides → intersections → 4 corners |
+| 12 | `fit_quad` | Canny + Hough on a mask → sides → intersections → 4 corners. With only 3 sides seen (one under the arms), `complete_side` puts the 4th back, keeping last frame's crop's proportions. |
+| 12 | `fit_quad_options` | Before the first lock: the 4-side fit, plus the hidden or least-supported side (often a sleeve or head lying across the real edge) completed from the PNG's shape at 0.85×, 1× and 1.15× the distance, since perspective shortens the far side. The score picks. |
 | 13 | `refine_with_traced_lines` | ICP: PNG walls+symbols onto traced frame ink, RANSAC homography, radius 14→4 px (§7.2) |
 | 13 | `shift_candidates` | FFT cross-correlation over ±35% shifts → restart points when the crop slipped (§7.4) |
 | 15 | `snap_corners` | `cornerSubPix`; ignored if it moves a corner > 8 px |
@@ -195,15 +203,32 @@ Step 11 was removed: it reused a side's line from an earlier frame when that sid
 
 `AutoCrop.update(frame, i)`:
 
-1. **Not found yet:** trace the whole frame; every 10 frames run `locate`. Locking needs a score ≥ 0.60 and the outline check.
-2. **Locked:** trace inside the last crop grown 35%. **Candidate A** is the last crop refined by ICP.
-3. If A scores below 0.60, add **candidates B**: each blob's `fit_quad`, or the ink-border fallback if no blob works, then snap and ICP.
-4. Every candidate goes through `check_quad` + `judge` (outline check, then the rubric). The best one scoring ≥ 0.40 wins; then `keep_if_stationary`, then `smooth`.
+1. **Not found yet:** trace the whole frame; every 10 frames run `locate`. Paper blobs come from `paper_mask` and from the paper color (`PaperModel.from_frame`, which keeps pale arms out of the blobs); each blob gives `fit_quad_options`. The best 3 pre-scored candidates each get a one-off paper model from their own pixels (`PaperModel.from_crop`), so hands on the real map don't sink its score. Locking needs a score ≥ 0.60 and the outline check.
+2. **Locked:** trace inside the last crop grown 35%, then `_see`: the video's paper model finds what covers the page, and the traced ink on and along it is dropped. **Candidate A** is the last crop refined by ICP.
+3. If A scores below 0.60, add **candidates B**: each blob's `fit_quad` (blobs from `paper_mask` and from the paper model's `sheet_mask`), or the ink-border fallback if no blob works, then snap and ICP.
+4. Every candidate goes through `check_quad` + `judge` (outline check, then the rubric, which only expects lines where the page isn't covered). The outline check needs paper/desk contrast, which isn't there where the map lies on the other sheet or under a sleeve, so a crop that fails it still counts if either (a) the edge points that can be judged pass and the lines score ≥ 0.60, or (b) while tracking, the lines score ≥ 0.75 and no corner moved more than 2% of the frame diagonal. On the benchmark frames, 463 deliberately wrong crops (shifted by a room, refined, rescored) scored at most 0.72, all ≥ 129 px off, so neither rule lets one through. This is what kept the S-15 videos, where the map overlaps the decoy, from ever confirming a crop. The best one scoring ≥ 0.40 wins; then `keep_if_stationary`, then `smooth`. Every 15 confirmed frames scoring ≥ 0.60, the paper model learns from the crop (it follows the lighting).
 5. **Nothing passed:** every 3 frames, `_realign` (shift search + ICP); then the PNG backup; then the flow backup; otherwise hold the crop.
-6. After 20 unconfirmed frames the map has **left the frame**: `_unlock` drops the crop (`corners = None`) and the next frames take branch 1 again, exactly as at the start of the video.
+6. Once found, the crop is **never dropped**: until the end of the video there is always a crop, confirmed or held. While held, a whole-frame `locate` runs every 10 frames, so a paper that was turned or slid under the hands is found again. Whether the participant touches the map is then decided by the fingertips alone.
 7. `correct_outlier_corner`, then `corner_visible`.
 
 **Source labels** (logged per frame): `searching`, `found`, `lines` (candidate A), `edges` (candidate B), `realigned`, `PNG`, `flow`, `held`, `manual`. (`lost` / `recovered` appear only in runs from before the map-left-the-frame change.)
+
+### `paper_model.py`: what covers the page
+
+Every video differs in lighting, skin tone, sleeves, watches, rings, bottles and phones, so nothing here is tuned per participant. Instead, the paper's own color is learned from each video, and anything on the page that isn't that color is an occluder.
+
+| Function | What it does |
+|---|---|
+| `PaperModel.maybe_learn` | Every 15 confirmed frames scoring ≥ 0.60: the crop's non-ink pixels, brightest half, trimmed to 3×MAD; their LAB median lightness and a*/b* mean and spread are blended in (25% new) |
+| `PaperModel.from_crop` / `from_frame` | One-off models before the first lock: from one candidate crop, or from the brightest pixels `paper_mask` accepts in the whole frame (every sheet is the same paper) |
+| `paper_pixels` | Paper = a*/b* within 3.5σ of the paper's color (σ never below 1.5) and lightness ≥ min(median − 5σ, 70% of it). Skin is told apart by a*: paper measured 126–128, even very pale skin 138–142. Dark sleeves and shadows fail the lightness test. |
+| `sheet_mask` | `paper_pixels` cleaned into whole sheets, for blob finding |
+| `visible` | 0 where something covers the page, plus an 8 px margin (a hand's outline and the shadow along it trace as long "walls"). Occluders are the non-paper areas left after an opening with an 11 px disc, which removes the thin printed strokes. Computed at half resolution (~12 ms). |
+| `clean_ink`, `covered` | Traced ink minus the occluded areas; the share of the crop that's covered |
+
+### `benchmark.py`: the crop tracker's test set
+
+`python benchmark.py run --tag NAME` runs auto-crop over the 10 benchmark videos and reports corner error on the 80 labeled frames, plus whole-video health (share of frames tracked, first lock, longest unconfirmed gap, ms per frame). `--quick` tracks only the 6 s before each labeled frame. `compare A B` puts two runs side by side; `label --from NAME` opens the corner editor to check or fix labels. Set `BENCH_CODE` to a folder to benchmark a modified copy of the pipeline. Labels are `checked` (exact), `rough` (placed by eye, within ~25 px) or `absent`.
 
 ### `edge_tracing.py`: line tracing
 
@@ -275,7 +300,8 @@ Called once at the end of a run by `run_pipeline.py`, after `timing.finish()`. E
 
 | Function | What it does |
 |---|---|
-| `save_data_files(run_dir, timing, ref, tracker, corner_motion)` | Writes `summary.csv`, `room_order.csv`, `corner_motion.csv`, `corner_motion.json`, `finger_positions.json` and copies the PNG to `floorplan.png` |
+| `save_data_files(run_dir, timing, ref, tracker, corner_motion, fps)` | Writes `summary.csv`, `room_order.csv`, `corner_motion.csv`, `corner_motion.json`, `finger_positions.json`, `tracking_quality.json` and copies the PNG to `floorplan.png` |
+| `tracking_quality(tracker, fps)` | `"status": "check"` when the map was never found, < 70% of frames after it was found had a confirmed crop, or the crop went unconfirmed for > 10 s at a stretch (with the reasons, first-found time and per-source frame counts); else `"ok"`. The run prints `CHECK THIS RUN BY HAND` when flagged. |
 | `summary_rows` | `Entire map` row (Room Time = `InteractionTimer`), then one row per room, then one per symbol not used as a room label (mostly entrances) |
 | `order_rows` | Every room visit sorted by entry time, revisits included |
 | `room_labels(room_map)` | `"<symbol(s)> (<room name>)"`: free-standing symbols inside the room, else entrance symbols leading in, else the corridor pattern. Shared with the live timer list (`t`) |
@@ -297,6 +323,7 @@ Runs `run_pipeline.py` (with a window) on every pair in its `PAIRS` list, one af
 | Missing files | A pair whose video or map isn't on disk is skipped and listed at the end, so the batch can run while videos are still downloading |
 | Failures | A run that exits with an error is listed at the end; the batch continues |
 | Ctrl+C | Stops the batch; the run in progress isn't saved (only its `map.json` exists) |
+| Runs to check | At the end, every run written by this batch whose `tracking_quality.json` says `check` is listed with its reasons |
 
 Re-running creates new run folders next to the old ones; nothing is overwritten.
 
@@ -351,15 +378,18 @@ The researcher-facing description of every file a run saves is [`data/README.md`
 ### The three CSVs (`data_export.py`)
 
 ```
-summary.csv        Room Symbol, Room Symbol Visits, Room Symbol Time, Entrance Symbol, Entrance Symbol Visits,
-                   Entrance Symbol Time, Room Visits, Room Time, Room Dimensions
-room_order.csv     Order, Time Entered (s), Time Exited (s)
-corner_motion.csv  Frame #, Timestamp (s), TL dx, TL dy, TR dx, TR dy, BR dx, BR dy, BL dx, BL dy
+summary.csv        Room Symbol, Room Symbol Visits, Room Symbol Time, Room Symbol Time (Left), (Right),
+                   Entrance Symbol, Entrance Symbol Visits, Entrance Symbol Time, Entrance Symbol Time (Left), (Right),
+                   Room Visits, Room Time, Room Time (Left), (Right), Room Dimensions
+room_order.csv     Order, Time Entered (s), Time Exited (s), Total Time (s)
+corner_motion.csv  Frame #, Timestamp (s), TL dx, TL dy, TR dx, TR dy, BR dx, BR dy, BL dx, BL dy,
+                   Left Index (x, y), Right Index (x, y), Left Index dx, Left Index dy, Right Index dx, Right Index dy
 ```
 
 - **`summary.csv` rows:** `Entire map` (Room Time = the main timer; dimensions = the sheet), then one row per room: its own symbol(s) (or its area pattern, timed by the room's timer) labeled `"<symbol> (<room>)"`, the entrance symbol(s) leading into it, and the room itself, each with its own visits and time; then any symbol that belongs to no room. Columns that don't apply to a row are blank, not 0. Times in seconds.
 - **`room_order.csv`:** room visits only (≥ 1 s), sorted by entry time. Rows can overlap in time when the two hands are in different rooms.
-- **`corner_motion.csv`:** blank vector cells mean the map wasn't in the frame, or it's the first sample after the map came back.
+- **`corner_motion.csv`:** blank corner cells mean the map hadn't been found yet, or it's the first sample after it was. The fingertip columns are in map pixels; a blank `dx, dy` means that hand wasn't seen on this sample or the one before.
+- **(Left) / (Right) columns:** `Timing.hand_timers` runs every timer a second time per hand, with the same rules, seeing only that hand's fingertip. Left + Right can exceed the combined time (both fingers in one room count once there).
 
 Before the October 2026 split, runs wrote a single `data.csv` holding all three tables side by side, with times as `M:SS.ss` and the corners in one cell. The Sheets importer skips those runs.
 
@@ -449,6 +479,12 @@ The frame's traced ink is warped into PNG space through the candidate crop and c
 - **F:** F-beta with β = 0.5, so precision counts twice as much. Hands hide ink, which costs recall, not precision.
 - **Score** = 0.4·F(walls) + 0.4·F(symbols) + 0.2·F(dots), renormalized if a class is absent from the map.
 
+Three refinements make the score fair across maps and participants:
+
+- **Textures are ignored.** Hatched and dotted areas (`ReferenceMap.texture`) blur into gray through the camera. Before this, on a map with a hatched corridor (P54), the hatch lines made up two thirds of the "walls", so a perfect crop scored 0.58 and never locked (S-6_Elevator was never found). Now it scores 0.74–0.85.
+- **Symbols and dots stand in for each other.** Blur runs a dashed line's dashes together into symbol-sized marks, which then flip between the two classes from frame to frame.
+- **Covered parts aren't expected** (`visible`, from `paper_model`). Recall only counts printed pixels that aren't under a hand, sleeve or object. A class with < 15% of its pixels in view is skipped; if the whole map is that hidden, visibility is ignored.
+
 Measured on S-19:
 
 | Candidate | Score |
@@ -506,7 +542,12 @@ On map E this finds 11 rooms (10 rooms + the corridor). The sealing width it pic
 | `TRACK_SCORE` | auto_crop | 0.40 | Per-frame acceptance |
 | `STRONG_SCORE` | auto_crop | 0.60 | Above this, skip paper-edge candidates (~75 ms saved) |
 | `SEARCH_EVERY` | auto_crop | 10 | Frames between searches before first lock |
-| `MAX_UNCONFIRMED` | auto_crop | 20 | Unconfirmed frames before the map counts as gone and the search restarts |
+| `COLD_START_STRETCHES` | auto_crop | 0.85, 1, 1.15 | Hidden-side distances tried before the first lock |
+| `TEXTURE_DENSITY` / `_WINDOW` | paper_locator | 11% / 41 px | What counts as a hatched / dotted area of the PNG |
+| `MIN_VISIBLE` | paper_locator | 15% | Share of a class that must be uncovered to judge it |
+| `CHROMA_SIGMAS` / `CHROMA_FLOOR` | paper_model | 3.5 / 1.5 | How close to the paper's color a pixel must be |
+| `OCCLUDER_MARGIN` | paper_model | 8 px | Ink this close to an occluder is its outline, not print |
+| `QUALITY_MIN_TRACKED` / `_MAX_GAP_S` | data_export | 70% / 10 s | When a run is flagged "check by hand" |
 | `CORNER_SAMPLES_PER_SECOND` | data_export | 4 | Corner-motion samples per second |
 | `PAGE_INCHES` | units | 8.5 × 11 | Physical sheet size for pixel → inch conversion |
 | `SEARCH_MARGIN` | paper_locator | 0.35 | Crop growth for the search window and tracing region (20% tested: 3× worse) |
@@ -533,6 +574,24 @@ On map E this finds 11 rooms (10 rooms + the corridor). The sealing width it pic
 | Crop cost | ~80–100 ms per frame typically (realignment ~0.5 s when it runs) |
 | Whole video, batch | ~10 minutes for 1:53 of video, including MediaPipe |
 | Rooms | 11 found automatically; 10 visited, 1 only brushed (one earlier run) |
+
+### Across sessions (`benchmark.py`: 10 random videos, 80 labeled frames)
+
+Before and after the paper model, texture-aware scoring and hidden-side completion (runs `baseline` and `v5`, 10 videos in parallel on one machine):
+
+| Measure | Before | After |
+|---|---|---|
+| Share of all frames with a confirmed crop | 56.6% | 77.4% |
+| Labeled frames found (corner error ≤ 25 px, or ≤ 40 px on rough labels) | 47 / 75 | 66 / 75 |
+| Missed (map in view, no crop) | 28 | 8 |
+| Wrong crop (> 25 px off) | 0 | 1 (a crop held while the paper slid under both arms) |
+| Crop on an absent map | 0 / 5 | 0 / 5 |
+| Longest unconfirmed stretch | 22.5 s | 12.9 s |
+| S-6_Elevator (hatched corridor) | never found | 64.7% of frames |
+| S-9_Inaccessible (head over the map) | 4.7% | 41.2% |
+| Time per frame (crop only) | 157 ms | 267 ms |
+
+The extra time is spent on the heavily covered videos, where the tracker now keeps trying (backups, and a whole-frame search every 10 held frames) instead of dropping the map; an easily tracked video runs as fast as before. Most "checked" labels were taken from verified crops of these runs, so small corner errors slightly favor the runs they came from; the miss and wrong-crop counts don't depend on that.
 
 ---
 

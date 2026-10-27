@@ -39,6 +39,7 @@ import numpy as np
 
 import edge_tracing
 import manual_crop
+import place_corners
 from auto_crop import AutoCrop
 from data_export import CornerMotion, clock, room_labels, save_data_files
 from finger_tracking import FingerTracker
@@ -317,8 +318,8 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
         floorplan.png          the floor plan PNG
         finger_paths.png       left (red) / right (blue) trails on the map
         finger_positions.json  every frame's index fingertips in map pixels
-        summary.csv, room_order.csv, corner_motion.csv, corner_motion.json
-                               (see data_export.py)
+        summary.csv, room_order.csv, corner_motion.csv, corner_motion.json,
+        tracking_quality.json  (see data_export.py)
     """
     for path in (video_path, map_path):
         if not os.path.isfile(path):
@@ -353,6 +354,9 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
     trail_hands = {"Left": True, "Right": True}   # l / r, under f
     speed = DEFAULT_PLAYBACK_SPEED
     frame_index, timestamp_ms, tips = 0, 0, []
+    start = place_corners.starting_corners(video_path)   # corners placed by hand, if any
+    if start:
+        print(f"Corners placed by hand (manual_corners.json): tracking starts at frame {start[0]}")
     print("Searching for the map..." + ("" if display else " (batch mode, no window)"))
 
     while True:
@@ -363,14 +367,17 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
         frame_index += 1
         timestamp_ms = int(round(1000.0 * frame_index / fps))
         was_locked = crop.locked
-        corners = crop.update(frame, frame_index)
-        if crop.locked and not was_locked:
+        if start and frame_index == start[0]:
+            crop.reset(frame, start[1])
+            corners = crop.corners
+            print(f"Started from the hand-placed corners at {timestamp_ms / 1000:.1f}s")
+        else:
+            corners = crop.update(frame, frame_index)
+        if crop.locked and not was_locked and crop.source != "manual":
             print(f"Found the map at {timestamp_ms / 1000:.1f}s (score {crop.score:.2f})")
-        elif was_locked and not crop.locked:
-            print(f"Lost the map at {timestamp_ms / 1000:.1f}s (it left the frame); searching again")
         tips = tracker.update(frame, corners, frame_index, timestamp_ms, crop.source, crop.score)
         timing.step(tips, timestamp_ms)
-        corner_motion.update(frame_index, timestamp_ms, corners)
+        corner_motion.update(frame_index, timestamp_ms, corners, tips)
 
         if not display:
             if frame_index % int(round(10 * fps)) == 0:
@@ -388,9 +395,6 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
                 tracker.draw_trails(shown, H, [h for h, on in trail_hands.items() if on])
             if show["edges"]:
                 draw_paper_debug(shown, frame, corners)
-        elif crop.lock_info is not None:   # found earlier, since gone
-            top = banner(shown, "The map has left the frame - looking for it again...",
-                         "Tracking resumes once it's back. Press Space to place the corners by hand.") + 10
         else:
             top = banner(shown, "Looking for the map...  (it isn't face-up on the table yet)",
                          "Press Space to place the corners by hand.") + 10
@@ -474,8 +478,11 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
     tracker.draw_trails(trails)
     cv2.imwrite(out("finger_paths.png"), trails)
     timing.finish()   # close any visit still open when the video ended
-    save_data_files(run_dir, timing, ref, tracker, corner_motion)
+    quality = save_data_files(run_dir, timing, ref, tracker, corner_motion, fps)
     print(f"Total time interacting with the map: {clock(timing.paper.elapsed_ms())}")
+    if quality["status"] == "check":
+        print("CHECK THIS RUN BY HAND: " + "; ".join(quality["reasons"]) +
+              " (see tracking_quality.json)")
     print(f"Saved everything to {run_dir}:")
     for name in sorted(os.listdir(run_dir)):
         print(f"  {name}")

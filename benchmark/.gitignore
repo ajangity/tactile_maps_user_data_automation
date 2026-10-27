@@ -1,0 +1,4 @@
+# Large and regenerable: `python benchmark.py make` re-extracts the frames,
+# and runs are re-made by `python benchmark.py run`.
+frames/
+runs/

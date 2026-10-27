@@ -106,11 +106,48 @@ def outline_agreement(gray, quad, samples_per_side=40):
     0.5-0.6 while being wrong. Measured on S-19: correct crops 0.81-0.82
     with hands on the page, crops stuck one room off 0.47-0.57.
     """
+    pin, pout = _outline_points(gray.shape, quad, samples_per_side)
+    if not len(pin):
+        return 0.0
+    inside = gray[pin[:, 1], pin[:, 0]].astype(int)
+    outside = gray[pout[:, 1], pout[:, 0]].astype(int)
+    return float(np.mean(inside - outside > OUTLINE_CONTRAST))
+
+
+OUTLINE_SEEN_MIN = 0.25          # share of edge points that must be judgeable
+
+
+def outline_agreement_seen(frame, gray, quad, model, visible, samples_per_side=40):
+    """outline_agreement, judged only where it can be: an edge point is
+    skipped when the point just inside it is under a hand or sleeve
+    (`visible`, see paper_model.py), or the point just outside it is paper
+    -- another sheet the map lies on or against, so there's no paper/desk
+    contrast to see. Fewer than OUTLINE_SEEN_MIN of the points judgeable
+    gives 0. auto_crop only uses this together with a strong line score."""
+    pin, pout = _outline_points(gray.shape, quad, samples_per_side)
+    if not len(pin) or model is None or not model.ready:
+        return 0.0
+    judge = np.ones(len(pin), bool)
+    if visible is not None:
+        judge &= visible[pin[:, 1], pin[:, 0]] > 0
+    outside_bgr = frame[pout[:, 1], pout[:, 0]].reshape(-1, 1, 3)
+    judge &= model.paper_pixels(outside_bgr).ravel() == 0
+    if judge.sum() < OUTLINE_SEEN_MIN * len(pin):
+        return 0.0
+    inside = gray[pin[judge, 1], pin[judge, 0]].astype(int)
+    outside = gray[pout[judge, 1], pout[judge, 0]].astype(int)
+    return float(np.mean(inside - outside > OUTLINE_CONTRAST))
+
+
+def _outline_points(shape, quad, samples_per_side):
+    """(inside points, outside points): pairs of pixels OUTLINE_OFFSET px
+    either side of the crop's edges, samples_per_side per edge, both in the
+    frame."""
     q = np.asarray(quad, np.float32)
     centre = q.mean(axis=0)
-    h, w = gray.shape[:2]
-    good = total = 0
+    h, w = shape[:2]
     t = np.linspace(0.05, 0.95, samples_per_side)[:, None]
+    ins, outs = [], []
     for i in range(4):
         a, b = q[i], q[(i + 1) % 4]
         normal = np.float32([-(b - a)[1], (b - a)[0]])
@@ -122,13 +159,9 @@ def outline_agreement(gray, quad, samples_per_side=40):
         pout = np.rint(pts - OUTLINE_OFFSET * normal).astype(int)
         valid = ((pin[:, 0] >= 0) & (pin[:, 0] < w) & (pin[:, 1] >= 0) & (pin[:, 1] < h) &
                  (pout[:, 0] >= 0) & (pout[:, 0] < w) & (pout[:, 1] >= 0) & (pout[:, 1] < h))
-        if not valid.any():
-            continue
-        inside = gray[pin[valid, 1], pin[valid, 0]].astype(int)
-        outside = gray[pout[valid, 1], pout[valid, 0]].astype(int)
-        good += int(np.sum(inside - outside > OUTLINE_CONTRAST))
-        total += int(valid.sum())
-    return good / total if total else 0.0
+        ins.append(pin[valid])
+        outs.append(pout[valid])
+    return np.concatenate(ins), np.concatenate(outs)
 
 
 # ======================================================================
