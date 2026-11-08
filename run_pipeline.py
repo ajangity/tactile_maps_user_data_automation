@@ -316,7 +316,7 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
         map.json               the map layout: rooms (labeled by symbol) and
                                symbols, with their pixel coordinates
         floorplan.png          the floor plan PNG
-        finger_paths.png       left (red) / right (blue) trails on the map
+        finger_paths.png       each hand's trail on the map, light green -> deep red over time, green dot = start, red dot = end (lettered L / R)
         finger_positions.json  every frame's index fingertips in map pixels
         summary.csv, room_order.csv, corner_motion.csv, corner_motion.json,
         tracking_quality.json  (see data_export.py)
