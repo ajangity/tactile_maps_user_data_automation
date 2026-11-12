@@ -51,11 +51,16 @@ TRACK_MARGIN = 0.50          # tips further out than this are ignored entirely
 PATH_BREAK_JUMP = 140.0      # map px; a trail never draws a straight line across a jump this
                              # big between frames (a hand reappearing elsewhere, or a tip
                              # mapped through a briefly-wrong crop) -- it starts a new stroke
-# Trail colours (BGR). A trail runs light green -> amber -> deep red over the
-# hand's time on the map, so it starts light and gets darker.
-TRAIL_GRADIENT = [(156, 214, 140),   # #8CD69C light green (start)
-                  (72, 178, 236),    # #ECB248 amber
-                  (40, 40, 178)]     # #B22828 deep red (end)
+# Trail colours (BGR). Each hand has its own gradient, so the two hands can
+# be told apart; each runs light -> dark over that hand's time on the map.
+TRAIL_GRADIENTS = {
+    "Left": [(156, 214, 140),        # #8CD69C light green (start)
+             (60, 150, 240),         # #F0963C orange
+             (40, 40, 178)],         # #B22828 deep red (end)
+    "Right": [(204, 168, 246),       # #F6A8CC light pink (start)
+              (226, 144, 74),        # #4A90E2 blue
+              (134, 42, 91)],        # #5B2A86 deep purple (end)
+}
 TRAIL_START_DOT = (90, 158, 46)      # #2E9E5A green: where the hand's trail starts
 TRAIL_END_DOT = (40, 40, 198)        # #C62828 red: where it ends
 
@@ -229,9 +234,10 @@ class FingerTracker:
 
     # ------------------------------------------------------------ drawing
     def draw_trails(self, canvas, H_map_to_canvas=None, hands=("Left", "Right")):
-        """Each hand's trail fades from light green (where it started) to
-        deep red (where it ended), with a green dot at its first point and a
-        red dot at its last, lettered L / R -- on the map (H None) or on a
+        """Each hand's trail fades light -> dark along its own gradient
+        (TRAIL_GRADIENTS: left green -> orange -> red, right pink -> blue ->
+        purple), with a green dot at its first point and a red dot at its
+        last, lettered L / R -- on the map (H None) or on a
         video frame (H = this frame's map -> frame homography). hands picks
         which trails to draw."""
         ends = []
@@ -244,7 +250,7 @@ class FingerTracker:
             drawn = [p for p in pts if p is not None]
             if not drawn:
                 continue
-            colors = trail_colors(len(drawn))
+            colors = trail_colors(len(drawn), TRAIL_GRADIENTS[hand])
             prev, i = None, 0
             for p in pts:
                 if p is not None:
@@ -265,10 +271,10 @@ class FingerTracker:
         self.detector.close()
 
 
-def trail_colors(n):
-    """n BGR colours along TRAIL_GRADIENT, blended in Lab so the middle stays
-    a clean amber instead of a muddy brown."""
-    stops = cv2.cvtColor(np.uint8([TRAIL_GRADIENT]), cv2.COLOR_BGR2LAB)[0].astype(np.float32)
+def trail_colors(n, gradient):
+    """n BGR colours along gradient (a list of BGR stops), blended in Lab so
+    the in-between colours stay clean instead of going muddy."""
+    stops = cv2.cvtColor(np.uint8([gradient]), cv2.COLOR_BGR2LAB)[0].astype(np.float32)
     t = np.linspace(0, len(stops) - 1, max(n, 1))
     k = np.minimum(t.astype(int), len(stops) - 2)
     f = (t - k)[:, None]
