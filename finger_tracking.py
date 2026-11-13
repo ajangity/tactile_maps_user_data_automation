@@ -51,6 +51,13 @@ TRACK_MARGIN = 0.50          # tips further out than this are ignored entirely
 PATH_BREAK_JUMP = 140.0      # map px; a trail never draws a straight line across a jump this
                              # big between frames (a hand reappearing elsewhere, or a tip
                              # mapped through a briefly-wrong crop) -- it starts a new stroke
+# Trail colours (BGR). A trail runs light green -> amber -> deep red over the
+# hand's time on the map, so it starts light and gets darker.
+TRAIL_GRADIENT = [(156, 214, 140),   # #8CD69C light green (start)
+                  (72, 178, 236),    # #ECB248 amber
+                  (40, 40, 178)]     # #B22828 deep red (end)
+TRAIL_START_DOT = (90, 158, 46)      # #2E9E5A green: where the hand's trail starts
+TRAIL_END_DOT = (40, 40, 198)        # #C62828 red: where it ends
 
 
 def create_hand_landmarker(model_path="hand_landmarker.task"):
@@ -222,23 +229,71 @@ class FingerTracker:
 
     # ------------------------------------------------------------ drawing
     def draw_trails(self, canvas, H_map_to_canvas=None, hands=("Left", "Right")):
-        """Left trail red, right trail blue -- on the map (H None) or on a
+        """Each hand's trail fades from light green (where it started) to
+        deep red (where it ended), with a green dot at its first point and a
+        red dot at its last, lettered L / R -- on the map (H None) or on a
         video frame (H = this frame's map -> frame homography). hands picks
         which trails to draw."""
-        for hand, color in (("Left", (0, 0, 255)), ("Right", (255, 0, 0))):
+        ends = []
+        for hand in ("Left", "Right"):
             if hand not in hands:
                 continue
             pts = self.paths[hand]
             if H_map_to_canvas is not None:
                 pts = _warp_points(pts, H_map_to_canvas)
-            prev = None
+            drawn = [p for p in pts if p is not None]
+            if not drawn:
+                continue
+            colors = trail_colors(len(drawn))
+            prev, i = None, 0
             for p in pts:
-                if p is not None and prev is not None:
-                    cv2.line(canvas, prev, p, color, 4, cv2.LINE_AA)
+                if p is not None:
+                    if prev is not None:
+                        cv2.line(canvas, prev, p, colors[i], 4, cv2.LINE_AA)
+                    i += 1
                 prev = p
+            # A trail may run a little off the canvas (PATH_MARGIN); its dots go
+            # on the first / last point that's on it, so they're never cut off.
+            h, w = canvas.shape[:2]
+            shown = [p for p in drawn if 0 <= p[0] < w and 0 <= p[1] < h] or drawn
+            ends += [(shown[0], TRAIL_START_DOT, hand), (shown[-1], TRAIL_END_DOT, hand)]
+        placed = []
+        for p, color, hand in ends:   # on top of both trails, so a trail never hides a dot
+            placed.append(_end_dot(canvas, p, color, hand[0], placed))
 
     def close(self):
         self.detector.close()
+
+
+def trail_colors(n):
+    """n BGR colours along TRAIL_GRADIENT, blended in Lab so the middle stays
+    a clean amber instead of a muddy brown."""
+    stops = cv2.cvtColor(np.uint8([TRAIL_GRADIENT]), cv2.COLOR_BGR2LAB)[0].astype(np.float32)
+    t = np.linspace(0, len(stops) - 1, max(n, 1))
+    k = np.minimum(t.astype(int), len(stops) - 2)
+    f = (t - k)[:, None]
+    lab = stops[k] * (1 - f) + stops[k + 1] * f
+    bgr = cv2.cvtColor(np.uint8(np.round(lab))[None], cv2.COLOR_LAB2BGR)[0]
+    return [tuple(int(c) for c in b) for b in bgr]
+
+
+def _end_dot(canvas, p, color, letter, placed=()):
+    """Draws one start/end dot; returns where it went. It's pulled in from the
+    canvas edge so it's drawn whole, and moved aside if it would cover a dot
+    already in `placed` (both hands starting or ending at the same spot)."""
+    h, w = canvas.shape[:2]
+    clamp = lambda q: (min(max(q[0], 13), w - 14), min(max(q[1], 13), h - 14))
+    p = clamp(p)
+    for _ in range(4):
+        if all(np.hypot(p[0] - q[0], p[1] - q[1]) >= 26 for q in placed):
+            break
+        p = clamp((p[0] + 28, p[1]) if p[0] + 28 < w - 14 else (p[0] - 28, p[1]))
+    cv2.circle(canvas, p, 13, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(canvas, p, 11, color, -1, cv2.LINE_AA)
+    (tw, th), _ = cv2.getTextSize(letter, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+    cv2.putText(canvas, letter, (p[0] - tw // 2, p[1] + th // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (255, 255, 255), 2, cv2.LINE_AA)
+    return p
 
 
 def _warp_points(points, H):
