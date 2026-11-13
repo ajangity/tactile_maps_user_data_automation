@@ -283,7 +283,7 @@ Checked on map E (20 symbols, 10 on walls; corridor #28: all correct) and map St
 | `hand_crop` | Paper bounding box + 22% / 30% margins, upscaled ≤ 2.5× (≈ 1280 px cap) |
 | `FingerTracker.update` | MediaPipe (2 hands, VIDEO mode) → landmark 8 → frame px → PNG px through this frame's homography. Sets `on_paper`; ignores tips > 50% off the map; appends the session-log record. |
 | `match_hands`, `label_hands`, `HandTrack` | Joint two-hand wrist matching (max jump 200 px), Left/Right from a fading, confidence-weighted memory of MediaPipe's labels |
-| `draw_trails` | Trails on the PNG or warped onto the video; they break at gaps and jumps > 140 px. Each hand's trail fades light green → amber → deep red over its time on the map (`TRAIL_GRADIENT`, blended in Lab by `trail_colors`), with a green dot where it starts and a red dot where it ends, lettered L / R (`TRAIL_START_DOT`, `TRAIL_END_DOT`) |
+| `draw_trails` | Trails on the PNG or warped onto the video; they break at gaps and jumps > 140 px. Each hand has its own gradient, light → dark over its time on the map: left light green → orange → deep red, right light pink → blue → deep purple (`TRAIL_GRADIENTS`, blended in Lab by `trail_colors`), with a green dot where it starts and a red dot where it ends, lettered L / R (`TRAIL_START_DOT`, `TRAIL_END_DOT`) |
 
 ### `timing.py`: step 25
 
