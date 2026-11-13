@@ -21,6 +21,11 @@ Every room / symbol timer works the same way (RegionTimer):
   - only visits of at least MIN_VISIT_MS (1 second) count as visits;
     shorter ones are "brushes" (a finger passing over)
 
+Separately, the video timer (VideoTimer) is just a clock of the video
+itself: how far into the video this frame is. It has nothing to do with
+the map and isn't one of the map's timers (it isn't in Timing.all(), so it
+never appears in summary.csv or room_order.csv).
+
 Every timer also runs once per hand (Timing.hand_timers): the same rules,
 but seeing only the left, or only the right, index fingertip. So a room's
 Left time is how long the left index finger was in it. The two hands'
@@ -158,6 +163,29 @@ class InteractionTimer(RegionTimer):
         self._start = None
 
 
+class VideoTimer:
+    """A clock of the whole video: the current frame's time. Runs from the
+    first frame to the last, whatever happens on the map."""
+
+    def __init__(self):
+        self.name, self.kind = "Video", "video"
+        self.now_ms = 0
+        self.running = False
+
+    @property
+    def occupied(self):
+        return self.running
+
+    def elapsed_ms(self):
+        return self.now_ms
+
+    def step(self, timestamp_ms):
+        self.now_ms, self.running = timestamp_ms, True
+
+    def close(self):
+        self.running = False
+
+
 def _in_bbox(bbox):
     x0, y0, x1, y1 = bbox
     return lambda x, y, tip: x0 <= x <= x1 and y0 <= y <= y1
@@ -191,6 +219,7 @@ class Timing:
     def __init__(self, room_map, manual_boxes=None):
         self.room_map = room_map
         w, h = room_map.width, room_map.height
+        self.video = VideoTimer()     # the whole video's clock, not a map timer
         self.paper = InteractionTimer(w, h)
         self.rooms = {}
         for r in room_map.rooms:
@@ -218,6 +247,7 @@ class Timing:
 
     def step(self, tips, timestamp_ms):
         """tips: this frame's fingertips from FingerTracker.update."""
+        self.video.step(timestamp_ms)
         for timer in self.all():
             inside = {t["hand"] for t in tips if timer.contains(t["map_x"], t["map_y"], t)}
             timer.step(inside, timestamp_ms)
@@ -228,6 +258,7 @@ class Timing:
         return [t for t in self.all() if t.occupied]
 
     def finish(self):
+        self.video.close()
         for timer in self.all():
             timer.close()
             for one in self.hand_timers(timer).values():

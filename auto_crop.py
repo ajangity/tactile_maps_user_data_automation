@@ -24,6 +24,14 @@ SEARCH_EVERY frames until a crop scores LOCK_SCORE. After that, each frame:
 Hands, sleeves and anything else on the page are found from the paper's
 color first (paper_model.py): the ink they cast is dropped, and the score
 only expects printed lines where the page is visible.
+The map is normally first found with all 4 corners in view (LOCK_SCORE);
+a map that never comes fully into view can still be found partly off the
+frame, but only with a stricter PARTIAL_LOCK_SCORE. After that the page
+may slide partly out of the frame: the crop keeps 4 corners, the ones
+outside the frame placed by the map's printed lines (step 13), the paper's
+remaining edges (a side along the frame border counts as hidden, see
+complete_side) or the backups, as long as MIN_IN_FRAME of the map is in
+view (crop_checker.check_quad, partial=True).
 Once the map has been found, the crop is never dropped: until the end of
 the video there is always a crop, confirmed or held. (A held crop is still
 re-checked by a whole-frame search every SEARCH_EVERY frames, so a paper
@@ -45,10 +53,12 @@ from corner_fitting import (corners_from_homography, fit_quad, fit_quad_options,
                             keep_if_stationary, pick_best,
                             refine_with_traced_lines, shift_candidates, smooth, snap_corners)
 from crop_checker import (MAX_JUMP, OUTLINE_MIN, FlowBackup, PngBackup, check_quad,
-                          corner_visible, correct_outlier_corner, outline_agreement,
+                          corner_visible, correct_outlier_corner, off_frame, outline_agreement,
                           outline_agreement_seen)
 
 LOCK_SCORE = 0.60        # first lock / recovery: a crop must score this
+PARTIAL_LOCK_SCORE = 0.75   # ...or this, if part of the map is off the frame (no wrong
+                            # crop on the benchmark frames scored above 0.72)
 TRACK_SCORE = 0.40       # per frame: a candidate must score this (orientation is already known)
 STRONG_SCORE = 0.60      # a traced-line crop this good skips the paper-edge candidates
 SEARCH_EVERY = 10        # frames between whole-frame searches before the first lock
@@ -181,8 +191,8 @@ class AutoCrop:
             for quad in [q for q, _ in fits] or [rough]:
                 candidates.extend(orientations(quad))                       # step 4
         candidates.extend(traced_map_quads(self.frame_ink, self.ref))      # step 3 (traced)
-        candidates = [q for q in candidates
-                      if check_quad(q, shape, self.ref.aspect)[0]]         # step 14
+        candidates = [q for q in candidates                                # step 14
+                      if check_quad(q, shape, self.ref.aspect, partial=True)[0]]
         if not candidates:
             return None
         pre = sorted(((self.score_quad(q), q) for q in candidates), key=lambda s: -s[0])
@@ -196,16 +206,15 @@ class AutoCrop:
                       PaperModel.from_crop(frame, q, raw_ink))
             H = refine_with_traced_lines(self.ref, self.frame_ink, homography_for(q, self.ref), q)
             q2 = corners_from_homography(H, self.ref)
-            if not check_quad(q2, shape, self.ref.aspect)[0]:
+            if not check_quad(q2, shape, self.ref.aspect, partial=True)[0]:
                 q2, H = q, homography_for(q, self.ref)
             score, detail, outline = self.judge(q2, H)
             detail["outline"] = round(outline, 3)
             results.append((score, q2, detail))
         self.frame_ink, self.visible, self._seen_by = raw_ink, None, None
-        best = max(results, key=lambda r: r[0])
-        if best[0] < LOCK_SCORE:
-            return None
-        return best
+        passed = [r for r in results
+                  if r[0] >= (PARTIAL_LOCK_SCORE if off_frame(r[1], shape) else LOCK_SCORE)]
+        return max(passed, key=lambda r: r[0]) if passed else None
 
     def _lock(self, frame, quad, score, detail, frame_index, source):
         self.corners = np.asarray(quad, np.float32)
@@ -276,7 +285,7 @@ class AutoCrop:
         # Candidate from edge tracing: last frame's crop, re-fit to the traced lines.
         H = refine_with_traced_lines(self.ref, self.frame_ink, homography_for(prior, self.ref), prior)
         quad = corners_from_homography(H, self.ref)
-        if check_quad(quad, shape, self.ref.aspect, prior, jump)[0]:
+        if check_quad(quad, shape, self.ref.aspect, prior, jump, partial=True)[0]:
             score, detail, outline = self.judge(quad, H, prior)
             scored.append((score, quad, {"source": "lines", "visible": None,
                                          "detail": detail, "outline": outline}))
@@ -302,7 +311,8 @@ class AutoCrop:
             if quad is not None:
                 fitted.append((quad, visible))
         for quad, visible in fitted:
-            if quad is None or not check_quad(quad, shape, self.ref.aspect, prior, jump)[0]:
+            if quad is None or not check_quad(quad, shape, self.ref.aspect, prior, jump,
+                                              partial=True)[0]:
                 continue
             quad = snap_corners(self.gray, quad, visible)                   # step 15
             # The paper's outline can't be fooled by repeating patterns, so
@@ -311,7 +321,7 @@ class AutoCrop:
             H = refine_with_traced_lines(self.ref, self.frame_ink,
                                          homography_for(quad, self.ref), quad)  # step 13
             refined = corners_from_homography(H, self.ref)
-            if check_quad(refined, shape, self.ref.aspect, prior, jump)[0]:
+            if check_quad(refined, shape, self.ref.aspect, prior, jump, partial=True)[0]:
                 quad = refined
             else:
                 H = homography_for(quad, self.ref)
@@ -350,7 +360,7 @@ class AutoCrop:
             H = refine_with_traced_lines(self.ref, self.frame_ink, H0,
                                          corners_from_homography(H0, self.ref))
             quad = corners_from_homography(H, self.ref)
-            if not check_quad(quad, shape, self.ref.aspect)[0]:
+            if not check_quad(quad, shape, self.ref.aspect, partial=True)[0]:
                 continue
             score, detail, outline = self.judge(quad, H)
             if score >= TRACK_SCORE and (best is None or score > best[0]):

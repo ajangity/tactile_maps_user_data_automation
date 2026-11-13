@@ -9,7 +9,10 @@ Step 14  check_quad      -- sanity checks every candidate crop must pass:
                             within 35% of the PNG's, big enough and not
                             hanging off the frame, and (while the lock is
                             trusted) no corner jumping more than 8% of the
-                            frame's diagonal since last frame.
+                            frame's diagonal since last frame. Once the map
+                            is being tracked (partial=True), corners may be
+                            off the frame -- the page slid partly out of
+                            view -- as long as MIN_IN_FRAME of it is in.
          outline_agreement -- and the crop's edges must sit on the paper's
                             real edges (paper inside, desk outside).
 Step 18  PngBackup       -- Backup #1: SIFT-match the frame against the PNG
@@ -38,6 +41,7 @@ CORNER_ANGLE_TOLERANCE = 25.0    # degrees from 90
 ASPECT_TOLERANCE = 0.35          # relative to the PNG's width/height
 MIN_AREA_FRACTION = 0.03         # of the frame
 EDGE_SLACK = 20                  # px a corner may sit outside the frame
+MIN_IN_FRAME = 0.35              # ...while tracking: share of the map that must be in the frame
 MAX_JUMP = 0.08                  # fraction of the frame diagonal per frame
 # Steps 18-19
 MIN_MATCHES = 14
@@ -56,17 +60,31 @@ OUTLIER_RATIO = 3.0              # ...and this many times more than the others
 # Step 14: sanity checks
 # ======================================================================
 
-def check_quad(quad, frame_shape, ref_aspect, prior=None, max_jump=None):
-    """Return (ok, reason). reason names the first check that failed."""
+def check_quad(quad, frame_shape, ref_aspect, prior=None, max_jump=None, partial=False):
+    """Return (ok, reason). reason names the first check that failed.
+
+    partial: the map is already being tracked, so corners may lie outside
+    the frame (the page slid partly out of view; the crop then says where
+    the hidden corners are). At least MIN_IN_FRAME of the crop must still
+    be in the frame, and that part must be big enough. Without it (finding
+    the map in the first place) every corner must be in view."""
     h, w = frame_shape[:2]
     p = np.asarray(quad, np.float32)
     if not np.all(np.isfinite(p)):
         return False, "not finite"
-    if cv2.contourArea(p) < MIN_AREA_FRACTION * w * h:
-        return False, "too small"
-    if (np.any(p[:, 0] < -EDGE_SLACK) or np.any(p[:, 0] > w + EDGE_SLACK) or
-            np.any(p[:, 1] < -EDGE_SLACK) or np.any(p[:, 1] > h + EDGE_SLACK)):
-        return False, "off the frame"
+    if partial:
+        area = abs(cv2.contourArea(p))
+        shown = in_frame_area(p, frame_shape)
+        if shown < MIN_AREA_FRACTION * w * h:
+            return False, "too small"
+        if shown < MIN_IN_FRAME * area:
+            return False, "off the frame"
+    else:
+        if cv2.contourArea(p) < MIN_AREA_FRACTION * w * h:
+            return False, "too small"
+        if (np.any(p[:, 0] < -EDGE_SLACK) or np.any(p[:, 0] > w + EDGE_SLACK) or
+                np.any(p[:, 1] < -EDGE_SLACK) or np.any(p[:, 1] > h + EDGE_SLACK)):
+            return False, "off the frame"
     for i in range(4):
         v1, v2 = p[i - 1] - p[i], p[(i + 1) % 4] - p[i]
         n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
@@ -87,6 +105,25 @@ def check_quad(quad, frame_shape, ref_aspect, prior=None, max_jump=None):
     return True, "ok"
 
 
+def in_frame_area(quad, frame_shape):
+    """Area (px) of the part of the crop that's inside the frame."""
+    h, w = frame_shape[:2]
+    p = np.asarray(quad, np.float32)
+    frame = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    if (cv2.contourArea(p, True) < 0) != (cv2.contourArea(frame, True) < 0):
+        p = p[::-1]                  # both the same way round
+    area, _ = cv2.intersectConvexConvex(np.ascontiguousarray(p), frame)
+    return max(float(area), 0.0)
+
+
+def off_frame(quad, frame_shape):
+    """Is any corner of this crop outside the frame?"""
+    h, w = frame_shape[:2]
+    p = np.asarray(quad, np.float32)
+    return bool(np.any(p[:, 0] < 0) or np.any(p[:, 0] > w - 1) or
+                np.any(p[:, 1] < 0) or np.any(p[:, 1] > h - 1))
+
+
 OUTLINE_MIN = 0.65               # outline_agreement a crop needs to be accepted
 OUTLINE_OFFSET = 8               # px inside / outside the edge to compare
 OUTLINE_CONTRAST = 25            # gray levels brighter inside than outside
@@ -105,6 +142,9 @@ def outline_agreement(gray, quad, samples_per_side=40):
     walls up with *other* walls, and the dots still match, so it can score
     0.5-0.6 while being wrong. Measured on S-19: correct crops 0.81-0.82
     with hands on the page, crops stuck one room off 0.47-0.57.
+
+    Edge points outside the frame (part of the page off-screen) aren't
+    judged; neither is the frame's own border, which isn't the paper's.
     """
     pin, pout = _outline_points(gray.shape, quad, samples_per_side)
     if not len(pin):
@@ -217,7 +257,7 @@ class PngBackup:
             return None, 0.0
         quad = cv2.perspectiveTransform(self.ref.corners[None], H)[0]
         ok, _ = check_quad(quad, frame_gray.shape, self.ref.aspect, prior,
-                           BACKUP_MAX_JUMP if strict else None)
+                           BACKUP_MAX_JUMP if strict else None, partial=True)
         if not ok:
             return None, 0.0
         if strict:
@@ -255,9 +295,9 @@ class FlowBackup:
         cv2.fillConvexPoly(mask, np.int32(corners), 255)
         mask = cv2.erode(mask, np.ones((15, 15), np.uint8))
         x0, y0, w, h = cv2.boundingRect(np.int32(corners))
-        x0, y0 = max(0, x0), max(0, y0)
-        region = mask[y0:y0 + h, x0:x0 + w]
-        region &= paper_mask(frame_bgr[y0:y0 + h, x0:x0 + w])
+        x0, y0, x1, y1 = max(0, x0), max(0, y0), x0 + w, y0 + h   # the crop may run off the frame
+        region = mask[y0:y1, x0:x1]
+        region &= paper_mask(frame_bgr[y0:y1, x0:x1])
         return cv2.goodFeaturesToTrack(gray, 700, 0.008, 7, mask=mask, blockSize=7)
 
     def locate(self, gray, prior, ref_aspect, score_fn):
@@ -295,7 +335,7 @@ class FlowBackup:
         if err >= 2.0 or hull / max(abs(cv2.contourArea(prior)), 1.0) <= 0.08:
             return None, 0.0
         quad = cv2.perspectiveTransform(prior[None], delta)[0]
-        ok, _ = check_quad(quad, gray.shape, ref_aspect, prior, BACKUP_MAX_JUMP)
+        ok, _ = check_quad(quad, gray.shape, ref_aspect, prior, BACKUP_MAX_JUMP, partial=True)
         if not ok:
             return None, 0.0
         score = score_fn(quad)
@@ -328,9 +368,12 @@ def correct_outlier_corner(new, prior):
 def corner_visible(frame, point, window=24):
     """Is the paper actually visible at this corner right now (not under a
     hand)? A local brightness split around the point; the bright side must
-    be paper-colored (low saturation), and both sides must really exist."""
+    be paper-colored (low saturation), and both sides must really exist.
+    A corner outside the frame isn't visible."""
     x, y = int(round(point[0])), int(round(point[1]))
     h, w = frame.shape[:2]
+    if not (0 <= x < w and 0 <= y < h):
+        return False
     x0, y0, x1, y1 = max(0, x - window), max(0, y - window), min(w, x + window), min(h, y + window)
     if x1 - x0 < 6 or y1 - y0 < 6:
         return False

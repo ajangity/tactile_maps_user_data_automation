@@ -390,6 +390,8 @@ def alignment_score(ref, frame_ink, H_frame_to_map, tol=SCORE_TOLERANCE, visible
     anything else, so a correct crop on a mostly covered page still scores
     well. A class with less than MIN_VISIBLE of its printed pixels in view
     is skipped; if the whole map is that hidden, visibility is ignored.
+    Without `visible`, a crop running off the frame still only expects
+    printed lines on the part of the map that's in the frame.
 
     Measured on the S-19 video: right orientation 0.98-0.99; same map
     rotated 180 degrees ~0.40; 90/270 degrees 0.10-0.14; the decoy sheet
@@ -402,6 +404,12 @@ def alignment_score(ref, frame_ink, H_frame_to_map, tol=SCORE_TOLERANCE, visible
         return result
     classes = edge_tracing.ink_classes(warped)
     in_view = None
+    if visible is None:
+        h, w = frame_ink.shape[:2]
+        corners = cv2.perspectiveTransform(ref.corners[None], np.linalg.inv(H_frame_to_map))[0]
+        if (np.any(corners < -0.5) or np.any(corners[:, 0] > w - 0.5) or
+                np.any(corners[:, 1] > h - 0.5)):
+            visible = np.full((h, w), 255, np.uint8)   # off-frame parts warp in as 0
     if visible is not None:
         in_view = cv2.warpPerspective(visible, H_frame_to_map, (ref.w, ref.h),
                                       flags=cv2.INTER_NEAREST) > 0

@@ -54,7 +54,8 @@ def draw_crop(shown, corners, H_map_to_frame, ref, crop):
     """The crop, made obvious: the PNG's printed lines drawn in cyan where
     the crop says they are (if the crop is right they sit exactly on the
     real printed lines), a green outline, and labeled corners (green =
-    corner visible, orange = covered)."""
+    corner visible, orange = covered). A corner outside the frame is shown
+    as a hollow red ring on the frame's edge, toward where it is."""
     h, w = shown.shape[:2]
     lines = cv2.warpPerspective(ref.trace.ink, H_map_to_frame, (w, h), flags=cv2.INTER_NEAREST)
     shown[lines > 0] = (255, 255, 0)
@@ -63,6 +64,13 @@ def draw_crop(shown, corners, H_map_to_frame, ref, crop):
     cv2.polylines(shown, [np.int32(corners)], True, color, 3, cv2.LINE_AA)
     for p, name, vis in zip(corners, ("TL", "TR", "BR", "BL"), crop.corner_visible):
         c = (int(p[0]), int(p[1]))
+        if not (0 <= c[0] < w and 0 <= c[1] < h):
+            c = (int(np.clip(c[0], 12, w - 13)), int(np.clip(c[1], 12, h - 13)))
+            cv2.circle(shown, c, 10, (0, 0, 255), 3, cv2.LINE_AA)
+            tx = c[0] + 14 if c[0] < w - 160 else c[0] - 150
+            cv2.putText(shown, name + " off-screen", (tx, max(c[1] - 10, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+            continue
         cv2.circle(shown, c, 8, (0, 220, 0) if vis else (0, 165, 255), -1)
         cv2.putText(shown, name, (c[0] + 10, c[1] - 10), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, color, 2, cv2.LINE_AA)
@@ -89,12 +97,14 @@ INSTRUCTIONS = [   # the numbered steps in the "i" panel
     "Check the crop: the cyan lines should sit exactly on the map's printed walls. If they "
     "don't, press Space, drag the 4 corners onto the paper's corners, then press Enter "
     "(Esc cancels).",
-    "Let the video play. The bottom bar shows the main map-interaction timer (running "
-    "whenever an index finger is on the map) and which room or symbol a finger is in.",
-    "Press t to watch every timer live (green = running), and f to show finger trails, "
-    "room outlines and symbol boxes on the video (l / r turn each hand's trail on and off).",
-    "If the map leaves the frame, tracking and the timers pause and the search restarts; "
-    "it locks on again by itself once the map is back.",
+    "Let the video play. The bottom bar shows the video timer (how far into the video you "
+    "are), the main map-interaction timer (running whenever an index finger is on the map) "
+    "and which room or symbol a finger is in.",
+    "Press t to watch every timer live, each with its Left and Right index finger times "
+    "(green = running), and f to show finger trails, room outlines and symbol boxes on the "
+    "video (l / r turn each hand's trail on and off).",
+    "Once the map is found, the crop stays on it until the end of the video, even if part "
+    "of the page slides out of the frame; the timers only run while a finger is on the map.",
     "Use ] / [ to play faster or slower. Every frame is still processed, so results don't "
     "depend on speed. Press c for the full list of keys.",
     "When the video ends, or when you press q, everything is saved to "
@@ -193,12 +203,14 @@ def draw_commands(shown, open_, state):
 
 
 def timer_list(timing, room_map):
-    """Every timer with an on-screen label, in display order: the main
-    timer, then each room followed by the symbol(s) it's named after, then
-    the remaining (entrance) symbols, then any hand-drawn boxes. A room is
-    named after its legend symbol, as in summary.csv: "Stairs #5 Room
-    Timer (Room 1)"; the corridor after its legend texture: "Corridor #28
-    Room Timer (Room 6)"."""
+    """Every timer with an on-screen label, in display order: the video
+    timer, the main timer, then each room followed by the symbol(s) it's
+    named after, then the remaining (entrance) symbols, then any hand-drawn
+    boxes. A room is named after its legend symbol, as in summary.csv:
+    "Stairs #5 Room Timer (Room 1)"; the corridor after its legend texture:
+    "Corridor #28 Room Timer (Room 6)". Returns (label, timer, hands):
+    hands is {"Left": timer, "Right": timer} (Timing.hand_timers), or None
+    for the video timer, which isn't about the map."""
     _, symbol_ids = room_labels(room_map)
     symbol_timers = {t.symbol["id"]: t for t in timing.symbols}
     out = [("Map Interaction Timer (main)", timing.paper)]
@@ -212,7 +224,8 @@ def timer_list(timing, room_map):
         used.update(ids)
     out += [(_symbol_label(t), t) for i, t in symbol_timers.items() if i not in used]
     out += [(f"{t.name} {t.kind.capitalize()} Timer", t) for t in timing.manual]
-    return out
+    return [("Video Timer", timing.video, None)] + [
+        (label, t, timing.hand_timers(t)) for label, t in out]
 
 
 def _symbol_label(timer):
@@ -223,22 +236,30 @@ def _symbol_label(timer):
 
 def draw_timers(shown, open_, timers, right):
     """Top right, left of the commands panel: a "press t" hint, or (once t
-    is pressed) every timer and its time so far -- "Stairs #5 Room
-    Timer (Room 1): 0:07.27". Green = a finger is in it right now. Rooms
-    and symbols only count visits of >= 1 s (see timing.py), so their time
-    starts moving 1 s into a visit; the main timer counts every frame.
+    is pressed) every timer and its time so far, then its Left and Right
+    index finger times -- "Stairs #5 Room Timer (Room 1): 0:07.27   L 0:05.10
+    R 0:02.17". Green = running right now (for L / R: that finger is in it).
+    Rooms and symbols only count visits of >= 1 s (see timing.py), so their
+    time starts moving 1 s into a visit; the main timer counts every frame.
+    The video timer is just how far into the video this frame is.
     Rows that don't fit the frame's height wrap into more columns."""
     font, scale, pad = cv2.FONT_HERSHEY_SIMPLEX, (0.5 if open_ else 0.6), 12
     line = 24 if open_ else 30
     if open_:
-        rows = [(f"{label}: {clock(t.elapsed_ms())}", t.occupied) for label, t in timers]
-        title = "Timers  (green = running)"
+        rows = []
+        for label, t, hands in timers:
+            row = [(f"{label}: {clock(t.elapsed_ms())}", t.occupied)]
+            if hands:
+                row += [(f"   {hand[0]} {clock(h.elapsed_ms())}", h.occupied) for hand, h in hands.items()]
+            rows.append(row)
+        title = "Timers  (green = running; L / R = left / right index finger)"
     else:
         rows, title = [], "Press t to view timers"
+    width = lambda text: cv2.getTextSize(text, font, scale, 1)[0][0]
     title_w = cv2.getTextSize(title, font, 0.6, 1)[0][0]
     per_col = max(1, (shown.shape[0] - 160 - 2 * line) // line)   # keep clear of the status bar
     columns = [rows[i:i + per_col] for i in range(0, len(rows), per_col)] or [[]]
-    col_w = max([cv2.getTextSize(text, font, scale, 1)[0][0] for text, _ in rows] or [0]) + 20
+    col_w = max([width("".join(text for text, _ in row)) for row in rows] or [0]) + 20
     w = max(title_w, col_w * len(columns)) + 2 * pad
     h = (1 + max(len(c) for c in columns)) * line + pad
     x0 = max(10, right - w - 10)
@@ -246,10 +267,13 @@ def draw_timers(shown, open_, timers, right):
     cv2.putText(shown, title, (x0 + pad, 10 + pad + 15), font, 0.6,
                 (0, 255, 255) if open_ else (255, 255, 255), 2 if open_ else 1, cv2.LINE_AA)
     for c, column in enumerate(columns):
-        for i, (text, running) in enumerate(column):
+        for i, row in enumerate(column):
             y = 10 + pad + 15 + (i + 1) * line
-            cv2.putText(shown, text, (x0 + pad + c * col_w, y), font, scale,
-                        (40, 255, 40) if running else (255, 255, 255), 1, cv2.LINE_AA)
+            x = x0 + pad + c * col_w
+            for text, running in row:
+                cv2.putText(shown, text, (x, y), font, scale,
+                            (40, 255, 40) if running else (255, 255, 255), 1, cv2.LINE_AA)
+                x += width(text)
 
 
 def draw_regions(shown, H_map_to_frame, timing):
@@ -421,7 +445,8 @@ def run(video_path, map_path, data_dir=DATA_DIR, display=True):
             sift = (f"  matches: {st['matches']}  error: {st['error']:.1f}px  "
                     f"coverage: {100 * st['coverage']:.1f}%")
         paper = timing.paper
-        status = (f"map time: {clock(paper.elapsed_ms())} ({'running' if paper.running else 'paused'})  "
+        status = (f"video: {clock(timing.video.elapsed_ms())}  "
+                  f"map time: {clock(paper.elapsed_ms())} ({'running' if paper.running else 'paused'})  "
                   f"crop: {crop.source} (score {crop.score:.2f}){sift}  hands: {len(tips)}  "
                   f"in: {inside}  speed: {speed:.2f}x   [Space] fix crop  [f] trails  [t] timers  [w] tracing  [q] quit")
         y = shown.shape[0] - 15

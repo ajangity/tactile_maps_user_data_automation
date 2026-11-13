@@ -54,7 +54,7 @@ Videos live in `mp4_user_data/` and maps in `png_reference_maps/`. The videos ar
 | `c` | Show / hide the on-screen list of every command (a "Press c" hint is always in the top-right corner) |
 | Space | Stop the video and drag the crop's corners by hand (`manual_crop.py`) |
 | `i` | Step-by-step instructions for using the script (top left, below any banner) |
-| `t` | Live list of every timer and its time so far (green = running) |
+| `t` | Live list of every timer and its time so far, each followed by its Left (L) and Right (R) index finger times (green = running). First row: the **Video Timer**, how far into the video the current frame is (`timing.VideoTimer`; not a map timer, so not in the CSVs). The bottom bar also shows it as `video:` |
 | `f` | Trails, room outlines and symbol boxes on the video |
 | `l` / `r` | While `f` is on: turn the left / right finger's trail on or off |
 | `e` | Paper-edge debug view: paper mask, search window, edges colored by side |
@@ -192,7 +192,7 @@ Step 11 was removed: it reused a side's line from an earlier frame when that sid
 
 | Function | What it does |
 |---|---|
-| `check_quad` | Corners within 25° of square; aspect within 35% of the PNG's; area ≥ 3% of the frame; corners ≤ 20 px off-frame; when trusted, no corner jumps > 8% of the frame diagonal |
+| `check_quad` | Corners within 25° of square; aspect within 35% of the PNG's; area ≥ 3% of the frame; corners ≤ 20 px off-frame (finding the map) or ≥ 35% of the map in the frame (tracking, `partial=True`); when trusted, no corner jumps > 8% of the frame diagonal |
 | `outline_agreement` | Share of 160 edge samples where the image is ≥ 25 gray levels brighter 8 px inside the crop than 8 px outside. A crop needs ≥ 0.65 (§7.3). |
 | `PngBackup.locate` | SIFT/ORB vs the PNG near the last crop. MAGSAC homography with ≥ 14 inliers, ≤ 3 px error and ≥ 3.5% coverage. When trusted, the area must be within 0.65–1.55× last frame's. Then score ≥ 0.35 plus the outline check. |
 | `FlowBackup.remember` / `locate` | Pyramidal LK flow on ≤ 700 paper points, forward-backward error < 1.5 px, homography error < 2 px. Points are only picked when the backup runs. |
@@ -208,8 +208,9 @@ Step 11 was removed: it reused a side's line from an earlier frame when that sid
 3. If A scores below 0.60, add **candidates B**: each blob's `fit_quad` (blobs from `paper_mask` and from the paper model's `sheet_mask`), or the ink-border fallback if no blob works, then snap and ICP.
 4. Every candidate goes through `check_quad` + `judge` (outline check, then the rubric, which only expects lines where the page isn't covered). The outline check needs paper/desk contrast, which isn't there where the map lies on the other sheet or under a sleeve, so a crop that fails it still counts if either (a) the edge points that can be judged pass and the lines score ≥ 0.60, or (b) while tracking, the lines score ≥ 0.75 and no corner moved more than 2% of the frame diagonal. On the benchmark frames, 463 deliberately wrong crops (shifted by a room, refined, rescored) scored at most 0.72, all ≥ 129 px off, so neither rule lets one through. This is what kept the S-15 videos, where the map overlaps the decoy, from ever confirming a crop. The best one scoring ≥ 0.40 wins; then `keep_if_stationary`, then `smooth`. Every 15 confirmed frames scoring ≥ 0.60, the paper model learns from the crop (it follows the lighting).
 5. **Nothing passed:** every 3 frames, `_realign` (shift search + ICP); then the PNG backup; then the flow backup; otherwise hold the crop.
-6. Once found, the crop is **never dropped**: until the end of the video there is always a crop, confirmed or held. While held, a whole-frame `locate` runs every 10 frames, so a paper that was turned or slid under the hands is found again. Whether the participant touches the map is then decided by the fingertips alone.
-7. `correct_outlier_corner`, then `corner_visible`.
+6. **Page partly out of frame.** The map must first be found with all 4 corners in view. After that the page may slide partly off the frame: the crop still has 4 corners, and those outside the frame (coordinates below 0 or past the frame size) are placed by the printed lines (`refine_with_traced_lines`), the remaining paper edges (a side along the frame border has no edge, so `complete_side` puts it back) or the backups. `check_quad(..., partial=True)` accepts this while ≥ 35% of the map is in the frame; the outline check skips edge points off the frame, and the line score only expects printed lines on the part of the map in the frame. The debug video shows an off-screen corner as a hollow red ring on the frame's edge.
+7. Once found, the crop is **never dropped**: until the end of the video there is always a crop, confirmed or held. While held, a whole-frame `locate` runs every 10 frames, so a paper that was turned or slid under the hands is found again. Whether the participant touches the map is then decided by the fingertips alone.
+8. `correct_outlier_corner`, then `corner_visible`.
 
 **Source labels** (logged per frame): `searching`, `found`, `lines` (candidate A), `edges` (candidate B), `realigned`, `PNG`, `flow`, `held`, `manual`. (`lost` / `recovered` appear only in runs from before the map-left-the-frame change.)
 
